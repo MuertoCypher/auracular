@@ -1,0 +1,1834 @@
+#!/usr/bin/env python3
+"""
+Auracular - AUR Heuristic Threat Model.
+
+Copyright (C) 2026 MuertoCypher
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version. See the LICENSE file for the full text.
+
+Not a verdict - a heuristic ranking to tell you which AUR packages deserve a
+manual look before (or after) install. High score = fewer red flags, not
+"proven safe". Anything flagged should still be read by a human.
+
+Checks each package's AUR metadata, its PKGBUILD text, and its git commit
+history (for a dormant-package-quietly-taken-over pattern) - not proof of
+safety or malice, just signals worth attention.
+
+Usage:
+    auracular                        # no args = score every installed AUR package
+    auracular pkgname [pkgname2 ...] # check specific package(s) instead, e.g. before installing
+    auracular -v                     # also show matched PKGBUILD lines
+    auracular --no-history           # skip the git-clone handoff check (faster)
+    auracular --explain pkgname      # plain-English, annotated PKGBUILD walkthrough
+"""
+import argparse
+import bisect
+import functools
+import json
+import math
+import pathlib
+import posixpath
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+import urllib.parse
+import difflib
+from datetime import datetime, timezone
+
+# Generated once via: figlet -f shadow AURACULAR
+BANNER_LINES = [
+    r"    \    |   |  _ \     \     ___| |   | |        \     _ \  ",
+    r"   _ \   |   | |   |   _ \   |     |   | |       _ \   |   | ",
+    r"  ___ \  |   | __ <   ___ \  |     |   | |      ___ \  __ <  ",
+    r"_/    _\\___/ _| \_\_/    _\\____|\___/ _____|_/    _\_| \_\ ",
+]
+
+def use_color():
+    return sys.stdout.isatty()
+
+# Every C0 control except tab/newline, DEL, and the full C1 control block
+# (\x80-\x9f) - the earlier version of this stopped at \x1f/\x7f and missed
+# \x0d (carriage return, usable for an overwrite-line display trick) and the
+# 8-bit C1 controls (e.g. U+009B, a single-codepoint form of CSI/ESC-[).
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+def sanitize(text):
+    """Strip control characters (including ESC and its 8-bit C1 form, which
+    defangs any ANSI escape sequence) from text that ultimately comes from
+    an untrusted package - its AUR description, PKGBUILD content, or git
+    author name. Without this, a malicious package could use terminal
+    escape sequences to hide/rewrite what this tool prints about it, or
+    \\r to overwrite a line's visible content. Newlines and tabs are left
+    alone; this only removes characters with no legitimate display use in a
+    one-line note or table cell."""
+    if text is None:
+        return text
+    return CONTROL_CHARS_RE.sub("", str(text))
+
+def print_banner():
+    width = len(BANNER_LINES[0])
+    lines = BANNER_LINES
+    tagline = "◉  AUR Heuristic Threat Model  ◉".center(width)
+    rule = "-" * width
+
+    color = use_color()
+    green, dim, reset = ("\033[92m", "\033[2m", "\033[0m") if color else ("", "", "")
+
+    print(green + rule + reset)
+    for l in lines:
+        print(green + l + reset)
+    print()
+    print(dim + green + tagline + reset)
+    print(green + rule + reset)
+    print()
+
+AUR_RPC = "https://aur.archlinux.org/rpc/v5/info"
+PKGBUILD_URL = "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h={pkg}"
+AUR_GIT_URL = "https://aur.archlinux.org/{pkg}.git"
+UA = {"User-Agent": "auracular/0.1 (local heuristic scanner)"}
+DORMANCY_THRESHOLD_DAYS = 180
+
+SUSPICIOUS_PATTERNS = [
+    (r"\b(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(env\s+)?\S*\b(sh|bash|zsh|dash|ksh|fish|python[23]?|perl|ruby|node|php)\b",
+     "pipes a download straight into an interpreter", 30),
+    # Deliberately scoped to eval, not bare $(curl ...)/`curl ...` - capturing
+    # a download's output into a variable (pkgver=$(curl ...) to read a
+    # remote version string, etc.) is an extremely common, benign PKGBUILD
+    # idiom. eval-ing that output is the actually dangerous, no-legitimate-
+    # use shape.
+    (r"\beval\b[^\n]*\$\(\s*(sudo\s+)?(curl|wget)\b", "runs eval on captured download output (executes it as code)", 30),
+    (r"\beval\b[^\n]*`\s*(sudo\s+)?(curl|wget)\b", "runs eval on captured download output via backticks (executes it as code)", 30),
+    (r"\b(curl|wget)\b[^\n|]*\s(-o|-O|--output|--output-document)\b[^\n|]*(/tmp/|\$\{?TMPDIR)",
+     "downloads a file into a temp path outside the build directory", 25),
+    (r"\bchmod\s+([0-7]*[1357]\b)[^\n]*(/tmp/|\$HOME|~/|\$\{?TMPDIR)",
+     "makes a file outside the build tree executable", 25),
+    (r"\bchmod\s+[0-7]?[2-7][0-7]{3}\b", "sets a setuid/setgid bit (numeric mode)", 25),
+    (r"\binstall\b[^\n]*-[a-zA-Z]*m\s*0?[2-7][0-7]{3}\b", "installs a file with a setuid/setgid bit", 25),
+    (r"\bchmod\s+[^\n]*\+s\b", "sets a setuid/setgid bit", 25),
+    (r"\bbase64\s+(-d|-D|--decode)\b|\bopenssl\s+(enc|base64)\b[^\n]*\s-d\b|\bxxd\s+-r\b|\buudecode\b",
+     "decodes an encoded blob (possible obfuscated payload)", 20),
+    (r"\btr\s+['\"\[]?[A-Za-z]-[A-Za-z][^\n]*\|\s*(sudo\s+)?(sh|bash|zsh)\b",
+     "de-obfuscates text and pipes it into a shell", 25),
+    (r"\b(z|bz|xz|zst)?cat\b[^\n]*\|\s*(sudo\s+)?(sh|bash|zsh)\b", "decompresses straight into a shell", 25),
+    (r"\beval\b", "uses eval (hides what actually runs)", 20),
+    (r"\b(bash|sh|zsh)\s+-c\s+[\"']?\$", "runs a dynamically built shell command", 25),
+    (r"\b(curl|wget)\b[^\n|]*\s(-d|--data|--data-binary|-F|--form|-T|--upload-file)\s",
+     "uploads data to a remote server", 30),
+    (r"/dev/tcp/|\bnc(at)?\s[^\n]*\s-[a-zA-Z]*e\b", "opens a reverse shell", 40),
+    (r"\.ssh/(id_[a-z0-9]+|authorized_keys)|\.gnupg|\.aws/credentials|/etc/shadow|\.config/(gh|hub)/|\.netrc",
+     "reads sensitive credential files", 35),
+    (r"/etc/sudoers|visudo", "touches sudoers", 35),
+    (r"authorized_keys", "touches SSH authorized_keys", 30),
+    (r"https?://\d{1,3}(\.\d{1,3}){3}", "downloads from a raw IP address instead of a domain", 15),
+    (r"://[^/\s]*\b(pastebin\.com|paste\.ee|ptpb\.pw|0x0\.st|transfer\.sh|file\.io|oshi\.at|temp\.sh|"
+     r"termbin\.com|ix\.io|dpaste\.[a-z]+|gist\.githubusercontent\.com|ngrok\.io|ngrok-free\.app|"
+     r"trycloudflare\.com|webhook\.site|requestbin\.[a-z]+|discord(app)?\.com/api/webhooks|api\.telegram\.org)\b",
+     "downloads from or posts to a paste/tunnel/webhook host", 25),
+]
+
+AUX_GLOBS = ("*.install", "*.hook", "*.service", "*.timer")
+SRCINFO = ".SRCINFO"
+
+def http_get(url, timeout=8):
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+def fetch_aur_info(names):
+    """Returns {name: info}, or None if the RPC lookup itself failed (network,
+    timeout, bad response, or the RPC's own error shape) - callers must not
+    treat None the same as {} (a lookup that succeeded and found nothing).
+    aurweb can return HTTP 200 with valid JSON that is still an error
+    (`{"type": "error", ...}`, or in principle `null`) - treating that as
+    "queried successfully, found nothing" would silently report every
+    requested package as HIGH RISK "not found on AUR" during an outage."""
+    if not names:
+        return {}
+    qs = "&".join("arg[]=" + urllib.parse.quote(n) for n in names)
+    url = f"{AUR_RPC}?{qs}"
+    try:
+        data = json.loads(http_get(url))
+    except Exception as e:
+        print(f"  ! AUR RPC lookup failed: {e}", file=sys.stderr)
+        return None
+    if not isinstance(data, dict) or data.get("type") != "multiinfo":
+        err = data.get("error") if isinstance(data, dict) else "unexpected response shape"
+        print(f"  ! AUR RPC returned an unexpected/error response: {err}", file=sys.stderr)
+        return None
+    results = data.get("results")
+    if not isinstance(results, list) or not all(valid_rpc_row(r) for r in results):
+        print("  ! AUR RPC response had a malformed 'results' field", file=sys.stderr)
+        return None
+    return {r["Name"]: r for r in results}
+
+# Latest timestamp datetime.fromtimestamp() can represent (end of year 9999).
+MAX_TIMESTAMP = 253402300799
+
+MAX_RPC_NUMBER = 1e12
+
+def valid_rpc_row(row):
+    """Every field scoring relies on has the type scoring expects. One bad
+    row fails the whole lookup: silently dropping it would turn that
+    package into a misleading "not found on AUR". A field may be absent
+    (scoring has a default), but only fields scoring treats as optional
+    may be explicitly null."""
+    def is_num(v):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return False
+        try:
+            return math.isfinite(float(v)) and 0 <= v <= MAX_RPC_NUMBER
+        except OverflowError:
+            return False
+
+    def is_ts(v):
+        return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= MAX_TIMESTAMP
+
+    def is_str(v):
+        return isinstance(v, str)
+
+    if not isinstance(row, dict) or not isinstance(row.get("Name"), str) or not row["Name"]:
+        return False
+    # field: (check, may be null)
+    checks = {
+        "NumVotes": (is_num, False), "Popularity": (is_num, False),
+        "FirstSubmitted": (is_ts, True), "OutOfDate": (is_ts, True),
+        "Maintainer": (is_str, True), "PackageBase": (is_str, True),
+    }
+    for key, (check, nullable) in checks.items():
+        if key not in row or (row[key] is None and nullable):
+            continue
+        if not check(row[key]):
+            return False
+    return True
+
+def fetch_pkgbuild(name):
+    try:
+        return http_get(PKGBUILD_URL.format(pkg=urllib.parse.quote(name)))
+    except Exception as e:
+        print(f"  ! couldn't fetch PKGBUILD for {name}: {e}", file=sys.stderr)
+        return None
+
+def looks_like_pkgbuild(text):
+    """A 200 OK response carrying an HTML error/challenge page (rate-limit,
+    WAF, anti-bot interstitial, ...) is not an exception - http_get returns
+    it as ordinary text, and scanning it finds no suspicious patterns
+    because it isn't shell code at all. Without this check that reads as
+    "scanned, clean" instead of "not actually read"."""
+    if not text:
+        return False
+    head = text[:2000]
+    if re.search(r"<!doctype html|<html[\s>]", head, re.IGNORECASE):
+        return False
+    return bool(re.search(r"^\s*pkgname\s*=", text, re.MULTILINE))
+
+def installed_foreign_packages():
+    try:
+        out = subprocess.run(["pacman", "-Qmq"], capture_output=True, text=True, check=True).stdout
+    except Exception as e:
+        print(f"Couldn't run pacman -Qmq: {e}", file=sys.stderr)
+        return []
+    return [l.strip() for l in out.splitlines() if l.strip()]
+
+def official_repo_names():
+    try:
+        out = subprocess.run(["pacman", "-Slq"], capture_output=True, text=True, check=True).stdout
+        return set(l.strip() for l in out.splitlines() if l.strip())
+    except Exception:
+        return set()
+
+# --- static shell lexing -------------------------------------------------
+# One pass shared by the red-flag scan, install-script discovery, and the
+# explainer's function extraction. It never executes anything: it only
+# tracks enough bash syntax (quotes, escapes, comments, line continuations,
+# command/process substitutions, heredocs) to know which text is code,
+# which is data, and where commands and { } groups begin and end.
+
+CONTINUATION_OPERATORS = ("|", "&&", "||", "|&")
+SHELL_OPERATORS = ("<<<", "<<-", ";;&", "&>>", "&&", "||", ";;", ";&", "|&", "&>", ">>",
+                   "<<", "<&", ">&", "<>", ">|", ";", "&", "|", "(", ")", "<", ">")
+SEPARATOR_OPERATORS = {"&&", "||", ";;&", ";;", ";&", "|&", ";", "&", "|", "(", ")"}
+WORD_BREAK_CHARS = set(" \t\n;&|<>()")
+# Reserved words after which the next word is still a command.
+COMMAND_PREFIX_WORDS = {"{", "!", "if", "then", "else", "elif", "do", "while", "until", "time"}
+ASSIGNMENT_WORD_RE = re.compile(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=")
+
+class ShellLex:
+    """Result of lex_shell(): statements are (line_no, text) for each
+    logical command line with comments removed and continuations joined;
+    heredoc_lines are (line_no, text) for each here-document body line
+    (data, after the outer shell's expansions for an unquoted delimiter);
+    heredoc_code are (line_no, text) statements from lexing each heredoc
+    body as shell code, since bodies are often fed to a shell; words are
+    (start, end, raw, command_position) for top-level words; complete is
+    False if the text ended inside a quote, substitution, or heredoc."""
+
+    def __init__(self, text):
+        self.text = text
+        self.pos = 0
+        self.statements = []
+        self.heredoc_lines = []
+        self.heredoc_code = []
+        self.words = []
+        self.complete = True
+        self._pending_heredocs = []
+        self._line_starts = [0] + [m.end() for m in re.finditer("\n", text)]
+
+    def line_no(self, offset):
+        return bisect.bisect_right(self._line_starts, offset)
+
+    def _at(self, s, offset=0):
+        return self.text.startswith(s, self.pos + offset)
+
+    def _operator(self):
+        for op in SHELL_OPERATORS:
+            if self._at(op):
+                self.pos += len(op)
+                return op
+        return None
+
+    def _single_quote(self):
+        end = self.text.find("'", self.pos + 1)
+        if end == -1:
+            self.complete = False
+            end = len(self.text) - 1
+        raw = self.text[self.pos:end + 1]
+        self.pos = end + 1
+        return raw
+
+    def _ansi_c_quote(self):
+        start = self.pos
+        self.pos += 2
+        while self.pos < len(self.text):
+            c = self.text[self.pos]
+            if c == "\\":
+                self.pos += 2
+                continue
+            self.pos += 1
+            if c == "'":
+                return self.text[start:self.pos]
+        self.complete = False
+        return self.text[start:]
+
+    def _backtick(self):
+        """Old-style command substitution. Inside backticks a backslash
+        before $, `, or \\ is removed and backslash-newline is a line
+        continuation; the result is then parsed as a command."""
+        line = self.line_no(self.pos)
+        self.pos += 1
+        inner = []
+        while self.pos < len(self.text):
+            c = self.text[self.pos]
+            if c == "\\" and self.pos + 1 < len(self.text):
+                nxt = self.text[self.pos + 1]
+                if nxt == "\n":
+                    self.pos += 2
+                    continue
+                if nxt in "$`\\":
+                    inner.append(nxt)
+                    self.pos += 2
+                    continue
+            if c == "`":
+                self.pos += 1
+                return "`" + self._lex_fragment("".join(inner), line) + "`"
+            inner.append(c)
+            self.pos += 1
+        self.complete = False
+        return "`" + "".join(inner)
+
+    def _lex_fragment(self, code, line, strict=True):
+        """Lex `code` as a separate command string (backtick contents, a
+        heredoc body fed to a shell) and return its statements joined by
+        newlines. Heredocs found inside are kept, at line `line`. With
+        strict, an incomplete fragment makes this lex incomplete too."""
+        sub = ShellLex(code)
+        sub._code()
+        if strict and not sub.complete:
+            self.complete = False
+        self.heredoc_lines.extend((line + n - 1, t) for n, t in sub.heredoc_lines)
+        self.heredoc_code.extend((line + n - 1, t) for n, t in sub.heredoc_code)
+        return "\n".join(t for _, t in sub.statements)
+
+    def _braced_parameter(self):
+        out = ["${"]
+        self.pos += 2
+        depth = 1
+        while self.pos < len(self.text):
+            c = self.text[self.pos]
+            if c == "\\":
+                if not self._at("\n", 1):
+                    out.append(self.text[self.pos:self.pos + 2])
+                self.pos += 2
+            elif c == "'":
+                out.append(self._single_quote())
+            elif c == '"':
+                out.append(self._double_quote())
+            elif c == "`":
+                out.append(self._backtick())
+            elif self._at("$("):
+                self.pos += 2
+                out.append("$(" + self._code(nested=True) + ")")
+            elif self._at("${"):
+                depth += 1
+                out.append("${")
+                self.pos += 2
+            else:
+                out.append(c)
+                self.pos += 1
+                if c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return "".join(out)
+        self.complete = False
+        return "".join(out)
+
+    def _double_quote(self):
+        out = ['"']
+        self.pos += 1
+        while self.pos < len(self.text):
+            c = self.text[self.pos]
+            if c == '"':
+                self.pos += 1
+                out.append('"')
+                return "".join(out)
+            if c == "\\":
+                if not self._at("\n", 1):
+                    out.append(self.text[self.pos:self.pos + 2])
+                self.pos += 2
+            elif self._at("$("):
+                self.pos += 2
+                out.append("$(" + self._code(nested=True) + ")")
+            elif self._at("${"):
+                out.append(self._braced_parameter())
+            elif c == "`":
+                out.append(self._backtick())
+            else:
+                out.append(c)
+                self.pos += 1
+        self.complete = False
+        return "".join(out)
+
+    def _word(self):
+        out = []
+        while self.pos < len(self.text):
+            c = self.text[self.pos]
+            if c == "(" and out and out[-1].endswith("="):
+                # array assignment: name=( ... )
+                self.pos += 1
+                out.append("(" + self._code(nested=True) + ")")
+            elif c in WORD_BREAK_CHARS:
+                break
+            elif c == "\\":
+                if not self._at("\n", 1):
+                    out.append(self.text[self.pos:self.pos + 2])
+                self.pos += 2
+            elif c == "'":
+                out.append(self._single_quote())
+            elif c == '"':
+                out.append(self._double_quote())
+            elif c == "`":
+                out.append(self._backtick())
+            elif self._at("$("):
+                self.pos += 2
+                out.append("$(" + self._code(nested=True) + ")")
+            elif self._at("${"):
+                out.append(self._braced_parameter())
+            elif self._at("$'"):
+                out.append(self._ansi_c_quote())
+            else:
+                out.append(c)
+                self.pos += 1
+        return "".join(out)
+
+    def _heredoc_operator(self, op):
+        start = self.pos
+        while self._at(" ") or self._at("\t"):
+            self.pos += 1
+        raw = self._word()
+        if not raw:
+            self.complete = False
+        delimiter = re.sub(r"""['"\\]""", "", raw)
+        quoted = any(ch in raw for ch in "'\"\\")
+        self._pending_heredocs.append((delimiter, op == "<<-", quoted))
+        return self.text[start:self.pos]
+
+    def _read_line(self):
+        nl = self.text.find("\n", self.pos)
+        end = len(self.text) if nl == -1 else nl
+        line = self.text[self.pos:end]
+        self.pos = end + 1
+        return line
+
+    def _heredoc_bodies(self):
+        """Consume pending here-document bodies. Each body is recorded
+        twice: as data (heredoc_lines; for an unquoted delimiter, with
+        backslash-newlines joined and substitutions normalized, since the
+        outer shell runs those) and as code (heredoc_code), because a body
+        is often fed to sh, bash, or source. The code view is speculative,
+        so its parse errors don't mark the whole lex incomplete."""
+        pending, self._pending_heredocs = self._pending_heredocs, []
+        for delimiter, strip_tabs, quoted in pending:
+            first_line = self.line_no(self.pos)
+            body, terminated = [], False
+            while self.pos < len(self.text):
+                line = self._read_line()
+                while not quoted and (len(line) - len(line.rstrip("\\"))) % 2 and self.pos < len(self.text):
+                    line = line[:-1] + self._read_line()
+                if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                    terminated = True
+                    break
+                body.append(line.lstrip("\t") if strip_tabs else line)
+            if not terminated:
+                self.complete = False
+            text = "\n".join(body)
+            if quoted:
+                self.heredoc_lines.extend((first_line + i, l) for i, l in enumerate(body))
+            else:
+                text = self._expand_heredoc(text, first_line)
+                self.heredoc_lines.append((first_line, text))
+            code = self._lex_fragment(text, first_line, strict=False)
+            if code:
+                self.heredoc_code.append((first_line, code))
+
+    def _expand_heredoc(self, body, line):
+        """Text of an unquoted here-document after the expansions the outer
+        shell performs: $( ), ` `, and ${ } are parsed as code; quotes and
+        # are ordinary characters."""
+        sub = ShellLex(body)
+        out = []
+        while sub.pos < len(body):
+            c = body[sub.pos]
+            if c == "\\" and body[sub.pos + 1:sub.pos + 2] in ("$", "`", "\\"):
+                out.append(body[sub.pos + 1])
+                sub.pos += 2
+            elif sub._at("$("):
+                sub.pos += 2
+                out.append("$(" + sub._code(nested=True) + ")")
+            elif sub._at("${"):
+                out.append(sub._braced_parameter())
+            elif c == "`":
+                out.append(sub._backtick())
+            else:
+                out.append(c)
+                sub.pos += 1
+        if not sub.complete:
+            self.complete = False
+        self.heredoc_lines.extend((line + n - 1, t) for n, t in sub.heredoc_lines)
+        self.heredoc_code.extend((line + n - 1, t) for n, t in sub.heredoc_code)
+        return "".join(out)
+
+    def _emit(self, start, buf):
+        text = "".join(buf)
+        if text.strip():
+            self.statements.append((self.line_no(start), text))
+
+    def _code(self, nested=False):
+        """Lex code to the end of the text, or (nested) up to and including
+        the `)` that closes a substitution or array, returning the
+        processed text in between."""
+        buf, start = [], None
+        command_position, redirect_target, function_name_next = True, False, False
+        # case WORD in PATTERN) ... ;; esac - case_expect counts the words
+        # still due after `case` (the subject, then `in`); case_patterns has
+        # one entry per open case, True while reading a pattern, where `)`
+        # ends the pattern instead of a subshell or substitution.
+        case_expect, case_patterns = 0, []
+        # coproc [NAME] { ...; } - 1 right after `coproc`, 2 after one more
+        # word, which may be NAME if a `{` group follows.
+        coproc_state = 0
+        depth = 0
+        while self.pos < len(self.text):
+            c = self.text[self.pos]
+            if c == "\n":
+                self.pos += 1
+                self._heredoc_bodies()
+                if "".join(buf).rstrip().endswith(CONTINUATION_OPERATORS):
+                    buf.append(" ")
+                elif nested:
+                    buf.append("\n")
+                    command_position = True
+                else:
+                    self._emit(start, buf)
+                    buf, start, command_position = [], None, True
+                continue
+            if c in " \t":
+                buf.append(c)
+                self.pos += 1
+                continue
+            if c == "\\" and self._at("\n", 1):
+                self.pos += 2
+                continue
+            if c == "#":
+                nl = self.text.find("\n", self.pos)
+                self.pos = len(self.text) if nl == -1 else nl
+                continue
+            if start is None:
+                start = self.pos
+            in_patterns = bool(case_patterns) and case_patterns[-1]
+            op = self._operator()
+            if op:
+                coproc_state = 0
+                if in_patterns and op in ("(", ")"):
+                    if op == ")":
+                        case_patterns[-1] = False
+                        command_position = True
+                    buf.append(op)
+                    continue
+                if nested and op == "(":
+                    depth += 1
+                elif nested and op == ")":
+                    if depth == 0:
+                        return "".join(buf)
+                    depth -= 1
+                if op in (";;", ";&", ";;&") and case_patterns:
+                    case_patterns[-1] = True
+                buf.append(op)
+                if op in ("<<", "<<-"):
+                    buf.append(self._heredoc_operator(op))
+                elif op in ("<", ">") and self._at("("):
+                    self.pos += 1
+                    buf.append("(" + self._code(nested=True) + ")")
+                elif op in SEPARATOR_OPERATORS:
+                    command_position = True
+                else:
+                    redirect_target = True
+                continue
+            word_start = self.pos
+            raw = self._word()
+            buf.append(raw)
+            opens_coproc_group = coproc_state == 2 and raw == "{"
+            is_command = ((command_position or opens_coproc_group) and not redirect_target
+                          and not in_patterns and not case_expect)
+            if not nested:
+                self.words.append((word_start, self.pos, raw, is_command))
+            after_coproc = coproc_state == 1
+            coproc_state = 0
+            if redirect_target:
+                redirect_target = False
+            elif case_expect:
+                case_expect -= 1
+                if case_expect == 0 and raw == "in":
+                    case_patterns.append(True)
+            elif in_patterns:
+                if raw == "esac":
+                    case_patterns.pop()
+                    command_position = False
+            elif function_name_next:
+                function_name_next = False
+                command_position = True
+            elif opens_coproc_group:
+                command_position = True
+            elif command_position:
+                if raw == "function":
+                    function_name_next = True
+                    command_position = False
+                elif raw == "case":
+                    case_expect = 2
+                    command_position = False
+                elif raw == "esac" and case_patterns:
+                    case_patterns.pop()
+                    command_position = False
+                elif raw == "coproc":
+                    coproc_state = 1
+                elif raw not in COMMAND_PREFIX_WORDS and not ASSIGNMENT_WORD_RE.match(raw):
+                    command_position = False
+                    if after_coproc:
+                        coproc_state = 2
+        if nested:
+            self.complete = False
+            return "".join(buf)
+        self._emit(start, buf)
+        return None
+
+@functools.lru_cache(maxsize=64)
+def lex_shell(text):
+    lex = ShellLex(text)
+    lex._code()
+    return lex
+
+def logical_lines(text):
+    """(line_no, text) for every logical command line (comments removed,
+    backslash and |/&&/|| continuations joined, quoted text kept since it
+    is often passed to eval or sh -c) and every heredoc body line, in
+    source order. A line that merely starts with # inside a quoted string
+    or heredoc is not a comment and is kept."""
+    lex = lex_shell(text)
+    return sorted(lex.statements + lex.heredoc_lines + lex.heredoc_code, key=lambda item: item[0])
+
+# Rules at or above this penalty are also checked against the raw view.
+RAW_VIEW_MIN_PENALTY = 25
+RAW_VIEW_PENALTY = 15
+
+def raw_view_lines(text):
+    """A second view of the text that doesn't depend on the lexer: every
+    backslash-newline removed and lines ending in |, &&, ||, or |& joined
+    with the next non-blank line, but comments, quotes, and heredocs left
+    exactly as they are. Used as a backstop for lexer mistakes."""
+    out, buf, start = [], "", None
+    for i, line in enumerate(text.split("\n"), 1):
+        if start is None:
+            start = i
+        if line.endswith("\\"):
+            buf += line[:-1]
+            continue
+        buf += line
+        if buf.rstrip().endswith(CONTINUATION_OPERATORS):
+            buf += " "
+            continue
+        out.append((start, buf))
+        buf, start = "", None
+    if buf.strip():
+        out.append((start, buf))
+    return out
+
+def scan_pkgbuild(text, source_label="PKGBUILD"):
+    """Charges each matching pattern once (with a count of how many lines it
+    hit), not once per line - a package repeating the same flagged line
+    several times shouldn't stack an unbounded, hard-to-read penalty.
+
+    Serious rules are also run against raw_view_lines(). A match that only
+    shows up there is either inside a real comment or string, or somewhere
+    the lexer misread. There's no telling which, so it's reported at a
+    moderate penalty that keeps the package out of LOW RISK and asks for a
+    manual look, rather than trusting the lexer with a clean result."""
+    flags = []
+    if not text:
+        return flags
+    source = sanitize(source_label)
+    lines = [(n, re.sub(r"[ \t]+", " ", l)) for n, l in logical_lines(text)]
+    raw_lines = None
+    for pattern, desc, penalty in SUSPICIOUS_PATTERNS:
+        hits = []
+        for n, l in lines:
+            m = re.search(pattern, l, re.IGNORECASE)
+            if m and all(n2 != n + l.count("\n", 0, m.start()) for n2, _ in hits):
+                hits.append((n + l.count("\n", 0, m.start()), l))
+        if hits:
+            line_no, line = hits[0]
+            flags.append({
+                "desc": desc, "penalty": penalty, "line_no": line_no,
+                "line": sanitize(" ".join(line.split())), "count": len(hits),
+                "source": source,
+            })
+            continue
+        if penalty < RAW_VIEW_MIN_PENALTY:
+            continue
+        if raw_lines is None:
+            raw_lines = [(n, re.sub(r"[ \t]+", " ", l)) for n, l in raw_view_lines(text)]
+        raw_hits = [(n, l) for n, l in raw_lines if re.search(pattern, l, re.IGNORECASE)]
+        if raw_hits:
+            line_no, line = raw_hits[0]
+            flags.append({
+                "desc": f"possibly {desc}: matched only in text the parser read as a comment or "
+                        f"plain data, so the parser may have misread it (analysis incomplete) - "
+                        f"check this line by hand",
+                "penalty": RAW_VIEW_PENALTY, "line_no": line_no,
+                "line": sanitize(" ".join(line.split())), "count": len(raw_hits),
+                "source": source,
+            })
+    if not lex_shell(text).complete:
+        flags.append({
+            "desc": "couldn't be fully parsed (unterminated quote, substitution, or heredoc) - "
+                    "findings for it may be incomplete",
+            "penalty": 10, "line_no": 0, "line": "", "count": 1, "source": source,
+        })
+    return flags
+
+MAX_AUX_FILE_BYTES = 1_000_000
+
+MISSING = "no such file in the package repo"
+
+def read_contained_file(root, path):
+    """(contents, None) if `path` is a regular, non-symlink file of sane size
+    fully inside `root`, else (None, reason). reason is MISSING when nothing
+    exists there, otherwise why an existing path was refused. A malicious
+    package's repo could commit a symlink (e.g. "pwn.install" ->
+    "/home/you/.ssh/id_rsa") or a "../"-style path to trick this scanner
+    into reading and displaying an arbitrary local file."""
+    try:
+        if path.is_symlink():
+            return None, "refused: it is a symlink"
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            return None, "refused: it points outside the package repo"
+        if not resolved.exists():
+            return None, MISSING
+        if not resolved.is_file():
+            return None, "refused: not a regular file"
+        if resolved.stat().st_size > MAX_AUX_FILE_BYTES:
+            return None, "refused: larger than the 1MB read limit"
+        return resolved.read_text(errors="replace"), None
+    except OSError as e:
+        return None, f"refused: read error ({e.strerror or e.__class__.__name__})"
+
+class AuxFiles(dict):
+    """{relative_path: contents} of files read from a package clone, plus
+    `skipped`: {relative_path: reason} for every requested or discovered
+    path that was not read, so "absent from this dict" is never ambiguous."""
+
+    def __init__(self):
+        super().__init__()
+        self.skipped = {}
+
+    def status(self, path):
+        """None if `path` was read, else the reason it wasn't."""
+        return None if path in self else self.skipped.get(path, MISSING)
+
+def parse_git_log(output):
+    """Parse NUL-separated `%ae%x00%an%x00%at` records. Returns (commits,
+    complete). Author names are chosen by whoever commits, so a delimiter
+    that can legally appear in a name (like "|") would let a committer
+    corrupt or hide their own record; NUL can't appear in either field.
+    complete is False if any record was still malformed, so callers can
+    report the history as unreliable instead of silently analyzing a
+    subset of it."""
+    commits, complete = [], True
+    for line in output.splitlines():
+        parts = line.split("\x00")
+        if len(parts) != 3:
+            complete = False
+            continue
+        email, author_name, ts = parts
+        try:
+            commits.append((email.strip().lower(), author_name.strip(), int(ts)))
+        except ValueError:
+            complete = False
+    return commits, complete
+
+def fetch_commit_history(name, extra_files=(), timeout=15):
+    """Clone the package's AUR git repo and return (commits, aux_files).
+
+    commits is a list of (email, author_name, unix_ts) per commit, oldest
+    first, or None if the history couldn't be read completely - callers
+    should treat None as "history unavailable", not "clean".
+
+    aux_files is an AuxFiles {relative_path: contents} for any .install/
+    .hook/.service/.timer files, plus any `extra_files` (relative paths,
+    e.g. an install script named by `install=` without a .install suffix),
+    plus the .SRCINFO file under the key SRCINFO along with any install
+    scripts it declares; its `skipped` records why every other requested
+    or discovered path wasn't read. .SRCINFO is metadata, not code: callers
+    should pop it before scanning. aux_files is None if the clone itself
+    failed or errored before any file could be read.
+
+    AUR packages are tiny repos (PKGBUILD + maybe an .install file), so a
+    full clone is cheap."""
+    tmpdir = tempfile.mkdtemp(prefix="aurtc-")
+    try:
+        url = AUR_GIT_URL.format(pkg=urllib.parse.quote(name))
+        r = subprocess.run(["git", "clone", "--quiet", url, tmpdir],
+                            capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return None, None
+        root = pathlib.Path(tmpdir).resolve()
+
+        commits = None
+        try:
+            r2 = subprocess.run(["git", "-C", tmpdir, "log", "--reverse", "--format=%ae%x00%an%x00%at"],
+                                 capture_output=True, text=True, timeout=timeout)
+        except (subprocess.SubprocessError, OSError):
+            r2 = None
+        if r2 is not None and r2.returncode == 0:
+            parsed, complete = parse_git_log(r2.stdout)
+            if complete:
+                commits = parsed
+
+        aux_files = AuxFiles()
+        srcinfo, _ = read_contained_file(root, root / SRCINFO)
+        if srcinfo is not None:
+            aux_files[SRCINFO] = srcinfo
+            extra_files = [*extra_files, *srcinfo_install_targets(srcinfo)]
+
+        candidates = [(str(p.relative_to(root)), p) for pattern in AUX_GLOBS for p in root.rglob(pattern)]
+        candidates += [(rel, root / rel) for rel in extra_files]
+        for key, p in candidates:
+            if key in aux_files or key in aux_files.skipped:
+                continue
+            if not p.is_relative_to(root):
+                aux_files.skipped[key] = "refused: it points outside the package repo"
+                continue
+            body, reason = read_contained_file(root, p)
+            if body is not None:
+                aux_files[key] = body
+            else:
+                aux_files.skipped[key] = reason
+        return commits, aux_files
+    except Exception:
+        return None, None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# Domains shared by unrelated strangers (free mail providers, GitHub's
+# per-user noreply domain, ...) - matching on these alone says nothing about
+# whether two commits came from the same person. A private/company domain
+# match is real evidence; a match on one of these needs corroboration too.
+GENERIC_EMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+    "yahoo.com", "proton.me", "protonmail.com", "pm.me", "icloud.com", "me.com",
+    "fastmail.com", "users.noreply.github.com", "posteo.de", "tutanota.com",
+    "mailbox.org", "web.de", "gmx.de", "gmx.net", "t-online.de", "qq.com", "163.com",
+}
+
+def identity_similar(a, b):
+    """a, b are (email, name). True if they plausibly belong to the same
+    person despite a cosmetic git-config change (same email, a matching
+    non-generic domain, a matching local-part on a generic domain, or a
+    close name match) - same person switching machines is common and
+    shouldn't read as a handoff. A shared *generic* domain (gmail.com,
+    users.noreply.github.com, ...) is NOT enough on its own: unrelated
+    people share those constantly, and treating it as a match would mask a
+    real handoff between two different Gmail users."""
+    email_a, name_a = a
+    email_b, name_b = b
+    if email_a == email_b:
+        return True
+    local_a, _, domain_a = email_a.partition("@")
+    local_b, _, domain_b = email_b.partition("@")
+    if domain_a and domain_a == domain_b:
+        if domain_a not in GENERIC_EMAIL_DOMAINS:
+            return True
+        if difflib.SequenceMatcher(None, local_a, local_b).ratio() > 0.8:
+            return True
+    return difflib.SequenceMatcher(None, name_a.lower(), name_b.lower()).ratio() > 0.75
+
+def analyze_maintainer_history(commits):
+    """Group commits into maintainer 'eras' (runs of similar identities) and
+    check whether ANY era boundary shows a long dormancy gap - the shape of
+    a dormant package getting quietly taken over, not routine
+    co-maintenance. Looking only at the last two eras (eras[-2] vs eras[-1])
+    would let a single follow-up commit under a third identity push the
+    actual takeover out of view, erasing the detection - so every boundary
+    is checked and the most recent qualifying one wins. Returns a dict
+    describing the handoff, or None if there isn't one / there's not enough
+    history to tell / a qualifying handoff is old and long-settled."""
+    if not commits or len(commits) < 2:
+        return None
+
+    eras = []
+    for email, author_name, ts in commits:
+        identity = (email, author_name)
+        if eras and any(identity_similar(identity, i) for i in eras[-1]["identities"]):
+            eras[-1]["identities"].add(identity)
+            eras[-1]["end_ts"] = ts
+            eras[-1]["count"] += 1
+        else:
+            eras.append({
+                "identities": {identity}, "start_ts": ts, "end_ts": ts,
+                "count": 1, "first_identity": identity,
+            })
+
+    if len(eras) < 2:
+        return None
+
+    boundaries = [
+        (i, (eras[i + 1]["start_ts"] - eras[i]["end_ts"]) / 86400)
+        for i in range(len(eras) - 1)
+    ]
+    qualifying = [(i, gap) for i, gap in boundaries if gap >= DORMANCY_THRESHOLD_DAYS]
+    if not qualifying:
+        return None
+
+    idx, gap_days = qualifying[-1]
+    latest_era = eras[idx + 1]
+    commits_since = sum(e["count"] for e in eras[idx + 1:])
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    since_takeover_days = (now_ts - latest_era["start_ts"]) / 86400
+
+    # A handoff that happened years ago, with the new maintainer having put
+    # in real work since, isn't a live signal - it's history. Reporting it
+    # forever just crowds out packages with an actual recent, thin handoff.
+    if since_takeover_days > 730 and commits_since > 5:
+        return None
+
+    new_identity_name = sanitize(latest_era["first_identity"][1])
+
+    return {
+        "gap_days": int(gap_days),
+        "commits_since": commits_since,
+        "since_takeover_days": int(since_takeover_days),
+        "new_identity_name": new_identity_name,
+    }
+
+def typosquat_check(name, official_names):
+    if name in official_names or not official_names:
+        return None
+    close = difflib.get_close_matches(name, official_names, n=1, cutoff=0.85)
+    if close and close[0] != name:
+        return close[0]
+    return None
+
+def score_package(name, info, pkgbuild_flags, typosquat_target, handoff=None,
+                   history_unavailable=False, aux_flags=None, coverage_flags=None, verbose=False):
+    """pkgbuild_flags is None when the PKGBUILD could not be fetched/scanned
+    at all (distinct from an empty list, which means it WAS scanned and
+    nothing matched) - callers must pass None rather than [] in that case,
+    or an unscanned package silently reads as "clean". aux_flags (findings
+    from .install/.hook/etc files) is kept as a SEPARATE parameter rather
+    than merged into pkgbuild_flags before calling this: merging them would
+    turn a None (PKGBUILD unscanned) into a non-None list the moment any
+    aux finding exists, silently erasing the "PKGBUILD was never read"
+    warning even though the PKGBUILD itself - the primary thing this tool
+    is supposed to check - still wasn't. coverage_flags (e.g. an install
+    script that couldn't be read) is separate for the same reason."""
+    score = 70  # neutral baseline
+    notes = []
+
+    if info is None:
+        return 0, ["not found on AUR (may have been removed, or you mistyped the name)"]
+
+    votes = info.get("NumVotes", 0)
+    pop = info.get("Popularity", 0.0)
+    maintainer = info.get("Maintainer")
+    first = info.get("FirstSubmitted")
+    age_days = (datetime.now(timezone.utc) - datetime.fromtimestamp(first, tz=timezone.utc)).days if first else None
+    age_str = f"{age_days}d old" if age_days is not None else "age unknown"
+    notes.append(f"baseline: {votes} votes, popularity {pop:.2f}, {age_str}, maintainer={sanitize(maintainer) or 'none'}")
+
+    if maintainer is None:
+        score -= 30
+        notes.append("orphaned: no maintainer")
+
+    unscanned = pkgbuild_flags is None
+    all_flags = (pkgbuild_flags or []) + (aux_flags or []) + (coverage_flags or [])
+
+    if votes < 5 and pop < 0.5:
+        score -= 15
+        notes.append(f"very low adoption ({votes} votes, popularity {pop:.2f})")
+    elif votes >= 50 and not all_flags:
+        # Popularity/age is not a mitigation for an actual code-execution
+        # finding - a compromised popular package is the primary threat
+        # this tool exists to catch, so don't let adoption offset it.
+        score += 10
+        notes.append(f"well-adopted ({votes} votes)")
+
+    if info.get("OutOfDate"):
+        ood = datetime.fromtimestamp(info["OutOfDate"], tz=timezone.utc)
+        days = (datetime.now(timezone.utc) - ood).days
+        penalty = min(20, 5 + days // 30)
+        score -= penalty
+        notes.append(f"flagged out-of-date {days}d ago and still unresolved")
+
+    if age_days is not None and age_days < 30:
+        score -= 10
+        notes.append(f"brand new package ({age_days}d old)")
+
+    if unscanned:
+        score -= 20
+        notes.append("PKGBUILD could NOT be fetched - it was NOT scanned; this score is "
+                      "metadata-only and must not be read as 'clean'")
+    for f in all_flags:
+        score -= f["penalty"]
+        line_suffix = f" -> {f['line']}" if verbose else ""
+        count_suffix = f" [x{f['count']}]" if f.get("count", 1) > 1 else ""
+        source = f.get("source", "PKGBUILD")
+        notes.append(f"{source}: {f['desc']} (line {f['line_no']}){count_suffix}{line_suffix}")
+
+    if typosquat_target:
+        established = age_days is not None and age_days >= 1000 and votes >= 5
+        if established:
+            score -= 10
+            notes.append(
+                f"name resembles official package '{typosquat_target}', but this package is "
+                f"well-established ({age_days}d old, {votes} votes) - likely a coincidence, not a typosquat"
+            )
+        else:
+            score -= 25
+            notes.append(f"name closely resembles official package '{typosquat_target}' - possible typosquat, treat with real caution")
+
+    if handoff:
+        penalty = 15
+        if handoff["commits_since"] <= 3:
+            penalty += 10
+        if handoff["since_takeover_days"] <= 90:
+            penalty += 10
+        score -= min(penalty, 35)
+        notes.append(
+            f"possible maintainer handoff: '{handoff['new_identity_name']}' took over after "
+            f"{handoff['gap_days']}d of dormancy - {handoff['commits_since']} commit(s) since, "
+            f"{handoff['since_takeover_days']}d ago"
+        )
+    elif history_unavailable:
+        notes.append("commit history unavailable - the maintainer-handoff check did not run")
+
+    score = max(0, min(100, score))
+
+    # A severe PKGBUILD finding is a ceiling, not just an addend - no
+    # combination of votes/age/popularity should be able to buy a package's
+    # way out of the bucket a remote-code-execution flag puts it in.
+    if unscanned:
+        score = min(score, 60)
+    if all_flags:
+        worst = max(f["penalty"] for f in all_flags)
+        if worst >= 30:
+            score = min(score, 24)
+        elif worst >= 20:
+            score = min(score, 49)
+
+    return score, notes
+
+# --- PKGBUILD explainer ------------------------------------------------
+# Static, best-effort line annotations for the prepare()/build()/check()/
+# package() functions. This never executes the PKGBUILD - only regex-reads
+# it - because the whole point is understanding it BEFORE trusting it
+# enough to run through makepkg.
+
+LINE_ANNOTATIONS = [
+    (r'^cd\s+"?\$srcdir', "moves into the extracted source directory"),
+    (r'^cd\s+"?\$pkgdir', "moves into the packaging directory (unusual here; normally only used inside package())"),
+    (r'\./configure\b', "runs an autotools 'configure' script to set up the build"),
+    (r'^\s*make\b.*\binstall\b', "installs the compiled output into the packaging directory"),
+    (r'^\s*make\b', "compiles the project with make"),
+    (r'\bcmake\b.*-B\s', "configures the build using CMake"),
+    (r'\bninja\b', "builds using Ninja (usually paired with CMake or Meson)"),
+    (r'\bmeson\s+setup\b', "configures the build using Meson"),
+    (r'\bcargo\s+build\b', "compiles a Rust project with Cargo"),
+    (r'\bgo\s+build\b', "compiles a Go project"),
+    (r'\bpip\s+install\b.*--root', "installs a Python package into the packaging directory"),
+    (r'\bnpm\s+(ci|install)\b', "installs Node.js dependencies"),
+    (r'\binstall\s+-D\S*m\s*0?7\d\d', "installs a file as an executable into the package"),
+    (r'\binstall\s+-D\S*m\s*0?6\d\d', "installs a file as regular data/config into the package"),
+    (r'\bstrip\b', "strips debug symbols from a compiled binary"),
+    (r'\bsed\s+-i\b', "edits a file in place - worth checking what it actually changes"),
+    (r'\bpatch\s+-p', "applies a patch file to the source before building"),
+    (r'\bln\s+-s\b', "creates a symlink"),
+    (r'\brm\s+-rf\b', "recursively force-deletes files - check the path is scoped to a build dir, not somewhere broader"),
+    (r'\bchmod\s+[0-7]?[2-7][0-7]{3}\b', "!! sets a setuid/setgid bit (numeric mode) - makes a binary run with its owner's (often root's) privileges no matter who runs it"),
+    (r'\bsudo\b', "!! runs a command as root - makepkg never needs this; a legitimate PKGBUILD never does this"),
+    (r'\bcurl\b|\bwget\b', "downloads something at build time - normally everything downloaded should already be listed in source=() instead, so this is worth a second look"),
+    (r'\bchmod\b.*\+s', "!! sets a setuid/setgid bit - makes a binary run with its owner's (often root's) privileges no matter who runs it"),
+    (r'\beval\b', "!! runs a dynamically-built command - hides what actually executes"),
+]
+
+KNOWN_HOSTS = {
+    "github.com", "gitlab.com", "sourceforge.net", "gnu.org", "kernel.org",
+    "pypi.org", "files.pythonhosted.org", "crates.io", "registry.npmjs.org",
+    "npmjs.com", "codeberg.org", "bitbucket.org",
+}
+
+def extract_scalar(text, varname):
+    # ^ (line-start, MULTILINE) rather than a word-boundary lookbehind: a
+    # lookbehind alone would still match "depends=" inside "makedepends=",
+    # AND - the bug this exact line once had - would match a commented-out
+    # "# install=old.install" too, since the character before "install" in
+    # a comment is just a space, which a word-boundary check treats as fine.
+    # PKGBUILD assignments are conventionally at column 0; requiring that
+    # rules out both problems at once.
+    m = re.search(rf'^{re.escape(varname)}=(.+)$', text, re.MULTILINE)
+    if not m:
+        return None
+    return m.group(1).strip().strip('"\'')
+
+def extract_array(text, varname):
+    # See extract_scalar for why this is ^-anchored rather than a lookbehind.
+    m = re.search(rf'^{re.escape(varname)}=\(([^)]*)\)', text, re.MULTILINE | re.DOTALL)
+    if not m:
+        scalar = extract_scalar(text, varname)
+        return [scalar] if scalar else []
+    try:
+        return shlex.split(m.group(1), comments=True)
+    except ValueError:
+        return m.group(1).split()
+
+FUNCTION_PARENS_RE = re.compile(r"[ \t]*\([ \t]*\)\s*")
+
+def function_definitions(text):
+    """(name, body_start, body_end, complete) for every `name() { ... }` or
+    `function name { ... }`, found with the shared lexer so braces inside
+    quotes, escapes (printf \\}), comments, heredocs, and substitutions
+    don't count, and only { / } words in command position open or close a
+    group. A commented-out or quoted definition can't be matched. A body
+    whose end can't be found runs to the end of the text, with complete
+    False. Yielded in the order the definitions appear."""
+    lex = lex_shell(text)
+    words = lex.words
+    for i, (_, end, raw, command_position) in enumerate(words):
+        if raw in ("{", "}") or i + 1 >= len(words):
+            continue
+        after_keyword = i > 0 and words[i - 1][2] == "function" and words[i - 1][3]
+        if not (command_position or after_keyword):
+            continue
+        open_start, open_end, open_raw, open_cmd = words[i + 1]
+        if open_raw != "{" or not open_cmd:
+            continue
+        between = text[end:open_start]
+        if not (FUNCTION_PARENS_RE.fullmatch(between) or (after_keyword and not between.strip())):
+            continue
+        depth, body_end = 0, None
+        for w_start, _, w_raw, w_cmd in words[i + 1:]:
+            if not w_cmd:
+                continue
+            if w_raw == "{":
+                depth += 1
+            elif w_raw == "}":
+                depth -= 1
+                if depth == 0:
+                    body_end = w_start
+                    break
+        if body_end is None:
+            yield raw, open_end, len(text), False
+        else:
+            yield raw, open_end, body_end, lex.complete
+
+def extract_function(text, funcname):
+    """(body, complete) for one function by name. body is None if there is
+    no such function; complete is False if its end couldn't be found, in
+    which case body runs to the end of the text."""
+    for name, body_start, body_end, complete in function_definitions(text):
+        if name == funcname:
+            return text[body_start:body_end], complete
+    return None, True
+
+def extract_function_body(text, funcname):
+    return extract_function(text, funcname)[0]
+
+# --- install script discovery -------------------------------------------
+# An install script runs as root, so missing one is a false "safe". Rather
+# than trust the resolver to find every declaration, discovery is paired
+# with a backstop: any lexed statement or heredoc line that could set
+# `install` but isn't a declaration this code fully understands is reported
+# as unaccounted for. The backstop is best-effort, not a guarantee: it sees
+# what the lexer sees, and text built at runtime (eval of constructed
+# strings, sourcing other files) is out of its reach - eval is flagged by
+# the red-flag scan instead.
+
+MAX_EXPANSIONS = 16
+
+def prelude_assignment_lines(pkgbuild):
+    """Line numbers of the PKGBUILD's leading run of plain assignments, which
+    ends at the first statement that is anything else.
+
+    This is the only place an assignment is established to run, exactly once,
+    before everything after it. Nothing in that run can branch, loop, open a
+    subshell, define a function or call one, so reaching a line inside it is
+    unconditional, and every function invocation in the file necessarily
+    happens after all of it. Real PKGBUILDs put their metadata here, which is
+    what makes such a narrow rule usable: pkgname, pkgver, source, and
+    install= itself are all header lines."""
+    lines = set()
+    for line_no, text in lex_shell(pkgbuild).statements:
+        if not SIMPLE_ASSIGNMENT_RE.fullmatch(text):
+            break
+        lines.add(line_no)
+    return lines
+
+def setter_texts(pkgbuild):
+    """(is_code, line_no, text) for every lexed statement (comments
+    removed, continuations joined) and every heredoc body view."""
+    lex = lex_shell(pkgbuild)
+    return ([(True, n, t) for n, t in lex.statements] +
+            [(False, n, t) for n, t in lex.heredoc_lines + lex.heredoc_code])
+
+def setter_re(var):
+    """Anything that could assign `var`: plain/append/indexed assignment,
+    printf -v, and declare-style builtins naming it as an argument or as a
+    nameref target (`declare -n ref=var`)."""
+    v = re.escape(var)
+    return re.compile(
+        rf"(?<![\w-]){v}(?:\[[^\]]*\])?\s*\+?="
+        rf"|\bprintf\b[^\n;&|]*-v\s*['\"]?{v}(?![-.\w])"
+        rf"|\b(?:read|declare|typeset|local|export|readonly|mapfile|readarray|unset)\b"
+        rf"(?:\s+[^\s;&|]+?)*?(?:\s+|=)['\"]?{v}(?![-.\w])"
+    )
+
+# One shell word: ${...} parameter expansions, unquoted characters without
+# operators/expansions that can't be followed statically, backslash
+# escapes, or complete quotes.
+SHELL_WORD = r"""(?:\$\{[^{}\s'"`]*\}|[^\s;&|<>()#'"\\`]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")*"""
+INSTALL_DECL_RE = re.compile(rf"\s*install=(?P<word>{SHELL_WORD})\s*")
+PKGNAME_CHARS_RE = re.compile(r"^[A-Za-z0-9@._+-]+$")
+
+# One plain assignment and nothing else: `x=word` or `x=(a b c)`, possibly
+# spanning lines inside the parentheses or a quote. Deliberately refuses
+# anything with a second command on it, a redirection, or an expansion this
+# code can't follow, so `a=1; b=2`, `if false; then`, `(`, and `f() {` are
+# all rejected.
+SIMPLE_ASSIGNMENT_RE = re.compile(
+    rf"\s*[A-Za-z_]\w*\+?=(?:\([^()]*\)|{SHELL_WORD})\s*", re.DOTALL)
+
+# $var, ${var}, or ${var%suffix} / ${var#prefix} (and %% / ##) with a
+# plain-text pattern, where shortest and longest match are the same.
+PARAMETER_RE = re.compile(
+    r"\$(?:\{(?P<braced>[A-Za-z_]\w*)(?:(?P<op>%%|%|##|#)(?P<pattern>[A-Za-z0-9._+@-]*))?\}"
+    r"|(?P<plain>[A-Za-z_]\w*))"
+)
+
+def expand_word(word, lookup):
+    """Every value `word` can statically take, applying bash quoting: no
+    expansion inside single quotes, and $var/${var} replaced by
+    lookup(var)'s candidate values elsewhere, including plain-text
+    ${var%suffix}/${var#prefix} trimming. Returns a sorted list, or None if
+    any part (command substitution, other ${...} forms, unknown variables,
+    leading ~) can't be resolved with confidence."""
+    results = [""]
+    quote = None
+    i = 0
+    while i < len(word):
+        c = word[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            else:
+                results = [r + c for r in results]
+            i += 1
+        elif c == "\\":
+            if i + 1 >= len(word):
+                return None
+            nxt = word[i + 1]
+            if quote == '"' and nxt not in '$`"\\':
+                results = [r + c for r in results]
+                i += 1
+            else:
+                results = [r + nxt for r in results]
+                i += 2
+        elif c == "'" and quote is None:
+            quote = "'"
+            i += 1
+        elif c == '"':
+            quote = None if quote == '"' else '"'
+            i += 1
+        elif c == "$":
+            m = PARAMETER_RE.match(word, i)
+            values = lookup(m.group("braced") or m.group("plain")) if m else None
+            if not values:
+                return None
+            op, pattern = m.group("op"), m.group("pattern")
+            if op in ("%", "%%"):
+                values = [v.removesuffix(pattern) for v in values]
+            elif op in ("#", "##"):
+                values = [v.removeprefix(pattern) for v in values]
+            results = [r + v for r in results for v in values]
+            if len(results) > MAX_EXPANSIONS:
+                return None
+            i = m.end()
+        elif c == "`" or (c == "~" and i == 0 and quote is None):
+            return None
+        else:
+            results = [r + c for r in results]
+            i += 1
+    if quote:
+        return None
+    return sorted(set(results))
+
+def variable_lookup(pkgbuild, name, base):
+    """lookup_at(line) -> a lookup(var) for expand_word, giving the literal
+    value(s) a variable holds where a reference on that line reads it: one
+    assignment that applies there, in a form that needs no evaluation.
+    pkgname also allows the AUR package name, and every element of a split
+    package's pkgname array (makepkg sets pkgname to each in turn).
+    pkgbase also allows the AUR package base, and defaults to the first
+    pkgname. Anything else is None (unresolved)."""
+    texts = setter_texts(pkgbuild)
+    prelude = prelude_assignment_lines(pkgbuild)
+    no_vars = lambda var: None
+
+    def assigned_values(var, ref_line, nested=False):
+        """Literal value(s) of `var` as read from `ref_line`. A scalar may
+        refer to other variables that are themselves plain literals (one
+        level, e.g. pkgname=${_pkgname}-git); those never get the AUR-name
+        augmentation, so an unresolvable pkgname can't be papered over
+        with the name the AUR reports.
+
+        Deliberately narrow: the variable must be written in exactly one
+        place in the whole file, that place must be a header assignment (see
+        prelude_assignment_lines), and it must come before the reference.
+        Everything else stays unresolved, and the caller reports that as
+        missing coverage.
+
+        The narrowness is the point. Bash expands an assignment's
+        right-hand side when it runs, and reading a PKGBUILD does not
+        establish that a given assignment ran: it may sit in a branch not
+        taken, in a subshell whose values never reach the parent, in a
+        function nobody calls, or in a function called at a moment this code
+        cannot pin down. A second writer anywhere means the value is not
+        settled even if this one is unconditional. Crediting any of those
+        picks a filename the build never installs, which is how a harmless
+        decoy script gets read while the real one goes unscanned."""
+        hits = [(is_code, n, t) for is_code, n, t in texts if setter_re(var).search(t)]
+        # Any other possible writer leaves the value unsettled. Not being able
+        # to prove an assignment applies is not a proof that it is irrelevant.
+        if len(hits) != 1:
+            return None if hits else []
+        is_code, hit_line, hit = hits[0]
+        if not is_code or hit_line not in prelude:
+            return None
+        # The reference may sit in the header too, where order still decides.
+        # A reference anywhere else is already past the whole header, so this
+        # one check covers both, including install= inside a package function.
+        if hit_line >= ref_line:
+            return None
+        v = re.escape(var)
+        if re.match(rf"\s*{v}=\(", hit):
+            # Array elements undergo brace expansion and may be indexed
+            # ([0]=x), so only pkgname's documented plain-name subset is
+            # accepted, and only when the whole declaration parses.
+            if var != "pkgname":
+                return None
+            arr = re.fullmatch(rf"\s*{v}=\(([^()]*)\)\s*", hit)
+            word = SHELL_WORD[:-1] + "+"
+            if not arr or not re.fullmatch(rf"\s*(?:{word}\s+)*(?:{word})?\s*", arr.group(1)):
+                return None
+            values = [expand_word(w, no_vars) for w in re.findall(word, arr.group(1))]
+            if any(val is None or len(val) != 1 for val in values):
+                return None
+            values = [val[0] for val in values]
+        else:
+            m = re.fullmatch(rf"\s*{v}=(?P<word>{SHELL_WORD})\s*", hit)
+            # A nested value is read where THIS assignment sits, not where
+            # the outer reference does.
+            inner = no_vars if nested else (lambda other: None if other == var else assigned_values(other, hit_line, True))
+            values = expand_word(m.group("word"), inner) if m and "\n" not in hit else None
+        if values is not None and var in ("pkgname", "pkgbase"):
+            if not all(PKGNAME_CHARS_RE.match(val) for val in values):
+                return None
+        return values
+
+    def lookup_at(ref_line):
+        def lookup(var):
+            values = assigned_values(var, ref_line)
+            if var == "pkgname":
+                if values is None:
+                    return None
+                return sorted(set(values) | {name})
+            if var == "pkgbase":
+                if values == []:
+                    names = assigned_values("pkgname", ref_line)
+                    values = names[:1] if names else None
+                if values is None:
+                    return None
+                return sorted(set(values) | {base})
+            return values or None
+        return lookup
+
+    return lookup_at
+
+def install_targets(pkgbuild, name, base):
+    """Install scripts the PKGBUILD may package, found statically without
+    sourcing it. makepkg accepts any filename, so no suffix is assumed.
+    Declarations anywhere in the file count, including every split
+    package's - sibling packages share this repo and maintainer, so
+    reading their scripts too is harmless extra coverage.
+
+    Returns (declarations, unaccounted): declarations is a list of
+    (raw_value, candidates) where candidates is a list of normalized
+    relative paths the value may resolve to, or None if unresolved;
+    unaccounted counts code lines that may set `install` in a form this
+    function doesn't understand (e.g. `a=1; install=x`, `printf -v
+    install`, a multi-line value, a heredoc line)."""
+    lookup_at = variable_lookup(pkgbuild, name, base)
+    setter = setter_re("install")
+    declarations, unaccounted_lines = [], set()
+    for is_code, line_no, text in setter_texts(pkgbuild):
+        if not setter.search(text):
+            continue
+        m = INSTALL_DECL_RE.fullmatch(text) if is_code and "\n" not in text else None
+        if not m:
+            unaccounted_lines.add(line_no)
+            continue
+        word = m.group("word")
+        values = expand_word(word, lookup_at(line_no))
+        if values is not None:
+            if not any(values):
+                continue  # install= / install='' - explicitly no script
+            values = sorted({normalize_repo_path(v) for v in values if v})
+        declarations.append((word, values))
+    return declarations, len(unaccounted_lines)
+
+def normalize_repo_path(path):
+    """Tidy a declared relative path without changing what it opens.
+    `./x`, `a//b`, and `a/./b` are safe to collapse, but `..` is not: the OS
+    applies it after following any symlinked directory before it, so
+    `link/../hook` may open a different file than `hook`. Such paths are
+    kept as written and resolved by the contained-file reader."""
+    if ".." in path.split("/"):
+        return path
+    return posixpath.normpath(path)
+
+def srcinfo_install_targets(srcinfo):
+    """install = <file> entries from .SRCINFO, which makepkg writes with
+    values already expanded. The maintainer produces this file too, so it
+    supplements the PKGBUILD's declarations and never replaces them."""
+    found = re.findall(r"^\s*install\s*=\s*(.*?)\s*$", srcinfo, re.MULTILINE)
+    return sorted({normalize_repo_path(v) for v in found if v})
+
+def annotate_line(line):
+    for pattern, note in LINE_ANNOTATIONS:
+        if re.search(pattern, line):
+            return note
+    return None
+
+def source_host(entry):
+    # PKGBUILD source entries may use "renamed-file::url" syntax. Only treat
+    # "::" as that separator if it appears BEFORE the URL's own "://" -
+    # otherwise it's more likely bash substring syntax inside a variable
+    # embedded in the URL itself, e.g. "${_realname::1}".
+    scheme_idx = entry.find("://")
+    prefix = entry[:scheme_idx] if scheme_idx != -1 else entry
+    sep = prefix.rfind("::")
+    url = entry[sep + 2:] if sep != -1 else entry
+    unresolved = "origin can't be statically resolved (built from a variable) - check how that variable is defined"
+    try:
+        parsed = urllib.parse.urlparse(url)
+        netloc = parsed.netloc
+    except ValueError:
+        # e.g. "https://[${_ipv6}]/..." - Python rejects a bracketed host
+        # that isn't a literal IPv6 address.
+        if "$" in url:
+            return None, unresolved
+        return None, "malformed URL - read this source entry yourself"
+    if "$" in netloc:
+        return None, unresolved
+    if not netloc:
+        if "$" in url:
+            return None, unresolved
+        return None, "local file bundled with the package (no download)"
+    label = "known code-hosting site" if netloc in KNOWN_HOSTS else "unrecognized host - worth a manual glance"
+    return netloc, label
+
+def print_explain_report(name, info, pkgbuild, base=None):
+    base = base or name
+    if not info:
+        print(f"'{name}' wasn't found on the AUR.")
+        return
+    if not pkgbuild:
+        print(f"Found '{name}' on the AUR, but couldn't fetch its PKGBUILD.")
+        return
+
+    print(f"=== {sanitize(name)} - what this package is ===")
+    print(f"  {sanitize(info.get('Description', '(no description)'))}")
+    print(f"  version: {sanitize(info.get('Version', '?'))}   maintainer: {sanitize(info.get('Maintainer')) or 'none (orphaned)'}")
+    print(f"  upstream: {sanitize(info.get('URL', '?'))}")
+    print(f"  votes: {info.get('NumVotes', 0)}   popularity: {info.get('Popularity', 0.0):.2f}")
+
+    print("\n=== dependencies ===")
+    for label, var in (("runtime (depends)", "depends"), ("build-time only (makedepends)", "makedepends"),
+                        ("optional (optdepends)", "optdepends")):
+        items = [sanitize(i) for i in extract_array(pkgbuild, var)]
+        if items:
+            print(f"  {label}: {', '.join(items)}")
+
+    print("\n=== where the source comes from ===")
+    sources = extract_array(pkgbuild, "source")
+    if not sources:
+        print("  no source=() array found (unusual - read the PKGBUILD directly)")
+    for entry in sources:
+        entry = sanitize(entry)
+        host, label = source_host(entry)
+        if host:
+            print(f"  {entry}\n    -> {host} ({label})")
+        else:
+            print(f"  {entry}\n    -> {label}")
+
+    print("\n=== what the build actually does ===")
+    any_function = False
+    # The order makepkg runs them in.
+    for func in ("verify", "prepare", "pkgver", "build", "check", "package"):
+        body, complete = extract_function(pkgbuild, func)
+        # Split packages (pkgname=(a b ...)) define package_<name>() per
+        # subpackage instead of one shared package() - fall back to that so
+        # --explain on a split package doesn't wrongly report "no package()".
+        if body is None and func == "package":
+            split_func = f"package_{name}"
+            body, complete = extract_function(pkgbuild, split_func)
+            if body is not None:
+                func = split_func
+        if body is None:
+            continue
+        any_function = True
+        print(f"\n  {func}() {{")
+        if not complete:
+            print("    !! couldn't find where this function ends - everything after its start is shown,")
+            print("       and the walkthrough may be wrong. Read this part of the PKGBUILD directly.")
+        for raw_line in body.splitlines():
+            line = sanitize(raw_line.strip())
+            if not line or line.startswith("#"):
+                continue
+            note = annotate_line(line)
+            if note:
+                print(f"    {line}")
+                print(f"        ^ {note}")
+            else:
+                print(f"    {line}")
+                print(f"        ^ (not a pattern this script recognizes - worth reading yourself)")
+        print("  }")
+    if not any_function:
+        print("  no verify()/prepare()/pkgver()/build()/check()/package() functions found - "
+              "unusual for a normal PKGBUILD")
+
+    flags = scan_pkgbuild(pkgbuild)
+    print("\n=== automated red-flag scan ===")
+    if flags:
+        for f in flags:
+            count_suffix = f" [x{f['count']}]" if f.get("count", 1) > 1 else ""
+            print(f"  ! {f['desc']}{count_suffix} (line {f['line_no']}): {f['line']}")
+    else:
+        print("  none of this script's known-bad patterns matched")
+
+    declarations, unaccounted = install_targets(pkgbuild, name, base)
+    for raw, cands in declarations:
+        if cands is None:
+            print(f"\n  !! sets install={sanitize(raw)} - a root-run install script whose name "
+                  f"can't be resolved statically; read the PKGBUILD to see which file that is")
+            continue
+        print(f"\n  !! sets install={sanitize(raw)} - that file can run code as ROOT at install/"
+              f"upgrade time, which --explain does not read. Fetch and read it yourself:")
+        for target in cands:
+            print(f"     https://aur.archlinux.org/cgit/aur.git/plain/"
+                  f"{urllib.parse.quote(target)}?h={urllib.parse.quote(base)}")
+    if unaccounted:
+        print(f"\n  !! {unaccounted} line(s) may set install= in a form this scan can't follow - "
+              f"search the PKGBUILD for 'install' and check each one yourself")
+
+    print(PKGBUILD_PRIMER)
+
+PKGBUILD_PRIMER = """
+=== PKGBUILD anatomy, quick primer ===
+A PKGBUILD is a bash script, not a config file - everything in it is code
+that runs. Reading order that actually matters:
+  1. source=()      what gets downloaded, and from where. This is the
+                     single most important line for trust - a package
+                     pulling from a domain you don't recognize deserves
+                     more scrutiny than one pulling from the project's own
+                     GitHub.
+  2. sha256sums=() / b2sums=()   checksums that pin the exact bytes of each
+                     source= entry. makepkg refuses to build if they don't
+                     match - this is what stops a compromised upstream
+                     server from silently swapping the tarball later.
+  3. prepare()      optional: patches/fixes applied to the source before
+                     building.
+  4. build()        compiles the software. For most packages this is just
+                     the project's normal build commands (make, cmake,
+                     cargo build, ...) - nothing package-specific should
+                     need to happen here beyond that.
+  5. package()      THIS is the one that matters most for "what ends up on
+                     my system" - it copies build output into $pkgdir,
+                     which becomes the actual installed package. Anything
+                     install -Dm... $pkgdir/... here is a real file that
+                     lands on your machine.
+$srcdir = where the source got extracted to (scratch space, thrown away
+after build). $pkgdir = the staging root for what actually gets installed
+- treat any line touching $pkgdir as the one to read most carefully.
+"""
+
+def install_coverage_flags(name, declarations, unaccounted, srcinfo_targets, aux_files):
+    """Findings for every install script that wasn't confirmed read. An
+    install script runs as ROOT at install/upgrade time, so an unread one
+    must never pass silently.
+
+    A declaration with several possible values is covered when at least one
+    was read and none was refused: a candidate that simply doesn't exist is
+    a hypothetical alternative (makepkg can't package a missing file), but
+    one that exists and was refused (symlink, too large, ...) may be the
+    real script. aux_files is None when no file could be read at all."""
+    status = aux_files.status if aux_files is not None else (lambda path: "the package repo wasn't read")
+    unread = {}
+    for raw, cands in declarations:
+        if cands is None:
+            unread.setdefault(raw, "its value can't be resolved statically")
+            continue
+        statuses = {c: status(c) for c in cands}
+        refused = {c: s for c, s in statuses.items() if s not in (None, MISSING)}
+        for c, s in refused.items():
+            unread.setdefault(c, s)
+        if not refused and all(s is not None for s in statuses.values()):
+            target = cands[0] if len(cands) == 1 else raw
+            reason = statuses[cands[0]] if len(cands) == 1 else MISSING
+            unread.setdefault(target, reason)
+    for target in srcinfo_targets:
+        s = status(target)
+        if s is not None:
+            unread.setdefault(target, f"{s} (declared in .SRCINFO)")
+
+    flags = [{
+        "desc": f"sets install={sanitize(target)} - that file can run code as ROOT at "
+                f"install/upgrade time, and this scan could not read it: {reason} "
+                f"(see: auracular --explain {name})",
+        "penalty": 10, "line_no": 0, "line": "", "count": 1, "source": "PKGBUILD",
+    } for target, reason in unread.items()]
+    if unaccounted:
+        flags.append({
+            "desc": f"may set install= in {unaccounted} place(s) this scan can't follow - a "
+                    f"root-run install script may have gone unread (see: auracular --explain {name})",
+            "penalty": 10, "line_no": 0, "line": "", "count": 1, "source": "PKGBUILD",
+        })
+    return flags
+
+def headline_reason(notes, max_len=58):
+    non_baseline = [n for n in notes if not n.startswith("baseline:")]
+    if not non_baseline:
+        return "no red flags, but no strong positive signals either"
+    text = "; ".join(non_baseline)
+    if len(text) <= max_len:
+        return text
+    cut = text.rfind(" ", 0, max_len - 3)
+    cut = cut if cut > 0 else max_len - 3
+    return text[:cut] + "... (see below)"
+
+def bucket(score):
+    if score >= 75:
+        return "LOW RISK"
+    if score >= 50:
+        return "REVIEW"
+    if score >= 25:
+        return "CAUTION"
+    return "HIGH RISK"
+
+# icon, ANSI color code per bucket. Kept to single-width, non-emoji-presentation
+# glyphs so table columns stay aligned across terminals/fonts.
+RISK_STYLE = {
+    "LOW RISK":  ("✓", "\033[92m"),  # check mark, green
+    "REVIEW":    ("?",      "\033[96m"),  # cyan
+    "CAUTION":   ("⚠", "\033[93m"),  # warning sign, yellow
+    "HIGH RISK": ("☠", "\033[91m"),  # skull, red
+}
+
+def color_wrap(text, color_code):
+    # Pad/measure `text` BEFORE calling this - wrapping happens after padding
+    # so escape codes never throw off column alignment.
+    if not use_color():
+        return text
+    return f"{color_code}{text}\033[0m"
+
+def styled_bucket_field(score, width):
+    label = bucket(score)
+    icon, color_code = RISK_STYLE[label]
+    padded = f"{icon} {label}".ljust(width)
+    return color_wrap(padded, color_code)
+
+def styled_score_field(score, width):
+    color_code = RISK_STYLE[bucket(score)][1]
+    padded = f"{score}".rjust(width)
+    return color_wrap(padded, color_code)
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("packages", nargs="*", help="AUR package names to check")
+    ap.add_argument("--installed", action="store_true", help="check every foreign/AUR package currently installed")
+    ap.add_argument("-v", "--verbose", action="store_true", help="show matched PKGBUILD lines")
+    ap.add_argument("--no-history", action="store_true",
+                     help="skip the git-history maintainer-handoff check (faster, but misses takeover detection)")
+    ap.add_argument("--explain", metavar="PKG",
+                     help="print a plain-English, annotated PKGBUILD walkthrough for one package")
+    args = ap.parse_args()
+
+    print_banner()
+
+    if args.explain:
+        explain_info = fetch_aur_info([args.explain])
+        if explain_info is None:
+            print("Couldn't reach the AUR RPC endpoint - try again in a moment.", file=sys.stderr)
+            sys.exit(1)
+        info = explain_info.get(args.explain)
+        base = info.get("PackageBase") or args.explain if info else args.explain
+        pkgbuild = fetch_pkgbuild(base) if info else None
+        if pkgbuild and not looks_like_pkgbuild(pkgbuild):
+            print(f"  ! fetched content doesn't look like a PKGBUILD (error/challenge page?)", file=sys.stderr)
+            pkgbuild = None
+        print_explain_report(args.explain, info, pkgbuild, base=base)
+        return
+
+    names = list(args.packages)
+    if args.installed or not names:
+        if not names:
+            print("No packages given - defaulting to every installed AUR package (--installed).", file=sys.stderr)
+        names += installed_foreign_packages()
+    names = sorted(set(names))
+
+    if not names:
+        print("No foreign (AUR) packages are currently installed.", file=sys.stderr)
+        sys.exit(0)
+
+    print(f"Looking up {len(names)} package(s) on AUR...", file=sys.stderr)
+    aur_info = fetch_aur_info(names)
+    if aur_info is None:
+        print("Couldn't reach the AUR RPC endpoint - no scores can be produced right now. "
+              "Try again in a moment.", file=sys.stderr)
+        sys.exit(1)
+    official_names = official_repo_names()
+
+    results = []
+    for name in names:
+        info = aur_info.get(name)
+        # AUR keys split packages (e.g. "gcc11-libs") by a separate PackageBase
+        # field ("gcc11") - the PKGBUILD and git repo live under the base name,
+        # not the package name, and fetching by `name` alone 404s silently.
+        base = (info.get("PackageBase") or name) if info else name
+
+        pkgbuild = fetch_pkgbuild(base) if info else None
+        if pkgbuild and not looks_like_pkgbuild(pkgbuild):
+            print(f"  ! fetched content for {name} doesn't look like a PKGBUILD "
+                  f"(error/challenge page?) - treating it as unscanned", file=sys.stderr)
+            pkgbuild = None
+        # None = never fetched/scanned (stays None all the way to score_package,
+        # which must not treat that as "scanned clean"); [] = scanned, no hits.
+        pkgbuild_flags = scan_pkgbuild(pkgbuild) if pkgbuild else (None if info else [])
+
+        declarations, unaccounted = install_targets(pkgbuild, name, base) if pkgbuild else ([], 0)
+        wanted = sorted({c for _, cands in declarations for c in (cands or [])})
+
+        tsquat = typosquat_check(name, official_names)
+
+        handoff = None
+        history_unavailable = False
+        aux_flags = []
+        aux_files = None
+        srcinfo_targets = []
+        if info and not args.no_history:
+            print(f"  checking commit history for {name}...", file=sys.stderr)
+            commits, aux_files = fetch_commit_history(base, extra_files=wanted)
+            if commits is None:
+                history_unavailable = True
+            else:
+                handoff = analyze_maintainer_history(commits)
+            if aux_files is not None:
+                srcinfo = aux_files.pop(SRCINFO, None)
+                srcinfo_targets = srcinfo_install_targets(srcinfo) if srcinfo else []
+            for fname, body in (aux_files or {}).items():
+                for f in scan_pkgbuild(body, source_label=fname):
+                    f["penalty"] = int(f["penalty"] * 1.5)  # runs as root at install time
+                    aux_flags.append(f)
+        aux_skipped = aux_files is None
+
+        coverage_flags = install_coverage_flags(name, declarations, unaccounted,
+                                                srcinfo_targets, aux_files)
+
+        score, notes = score_package(name, info, pkgbuild_flags, tsquat, handoff=handoff,
+                                      history_unavailable=history_unavailable,
+                                      aux_flags=aux_flags, coverage_flags=coverage_flags,
+                                      verbose=args.verbose)
+        if info and args.no_history:
+            notes.append("commit history check skipped (--no-history) - maintainer-handoff "
+                          "detection AND auxiliary/.install file scanning did not run")
+        elif info and aux_skipped:
+            notes.append("auxiliary/.install file scanning did not run (commit history was unavailable)")
+        if base != name:
+            notes.insert(0, f"part of split package base '{base}' - PKGBUILD/history read from there")
+        results.append((name, score, notes))
+
+    results.sort(key=lambda r: r[1])  # riskiest first
+
+    print()
+    print(f"{'PACKAGE':<24}{'SCORE':>6}  {'RISK':<12}WHY")
+    print("-" * 90)
+    for name, score, notes in results:
+        print(f"{name:<24}{styled_score_field(score, 6)}  {styled_bucket_field(score, 12)}{headline_reason(notes)}")
+
+    print()
+    print("Details (riskiest first):")
+    for name, score, notes in results:
+        if not notes:
+            continue
+        print(f"\n{name} [{score}/100, {styled_bucket_field(score, 0)}]")
+        for n in notes:
+            print(f"  - {n}")
+
+if __name__ == "__main__":
+    main()
